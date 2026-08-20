@@ -29,7 +29,7 @@ Auth (from `crates/loom/src/server.rs`):
 | Name / description | **Loom CD — loom**. After Origin merge or push to `main`, deploy this SHA only if Loom evidence says tests passed. |
 | Trigger | Pull request merged; push to `main` |
 | Tools | Comment on PRs |
-| Instructions | GET evidence with owner token; stop unless `tests_passed`; POST deploy with deploy token only; comment; never compile/SSH/merge |
+| Instructions | GET evidence with owner token; stop unless `tests_passed`; POST deploy with deploy token only; retry the deploy POST once on `origin.deploy_failed` (self-restart); comment; never compile/SSH/merge |
 | Resolved settings | Origin repo `grogan-dev/loom`, branch `main`, Loom slug `loom` |
 | To finish in editor | Repo picker, both secrets, PR comments, both triggers, save |
 
@@ -49,7 +49,9 @@ You are Cursor Cloud CD for Origin repo grogan-dev/loom. Loom (https://loom.grog
    Header: Authorization: Bearer <value of env LOOM_DEPLOY_TOKEN>
    Empty body. Never send LOOM_TOKEN on this request (owner token is rejected).
 
-5. Comment the deploy result on the Origin PR if one exists: HTTP status and JSON status, tests_passed, job_id, log excerpt. 200 means Loom applied (or the SHA was already deployed). 409 origin.deploy_blocked means evidence was not passing. 401 means the wrong token.
+5. Self-deploy retry: this repo is Loom itself, and applying it restarts the Loom service mid-request. If the POST returns 409 with code origin.deploy_failed (not origin.deploy_blocked) or times out, wait 30 seconds and repeat the same POST exactly once. The retry no-ops against the recorded applied SHA and returns 200. Treat the second response as final.
+
+6. Comment the deploy result on the Origin PR if one exists: HTTP status and JSON status, tests_passed, job_id, log excerpt. 200 means Loom applied (or the SHA was already deployed). 409 origin.deploy_blocked means evidence was not passing. 401 means the wrong token.
 
 Hard rules: do not run cargo, go, npm, make, ssh, git push, or merge. Do not call any Loom path except the GET and POST above. Do not change Origin protections or DNS. Base URL is https://loom.grogan.dev.
 ```

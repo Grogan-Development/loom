@@ -98,6 +98,8 @@ Cursor Cloud is CD only: after an Origin merge or push to `main`, an agent may r
 
 Create **one Cursor Automation per Origin repo** (`grogan-dev/loom`, `grogan-dev/nero`, `grogan-dev/grid`). Paste the prompt from [`deploy/cloud-cd-prompt.md`](deploy/cloud-cd-prompt.md). Tools: comment on PRs. Secrets: `LOOM_TOKEN` (GET evidence) and `LOOM_DEPLOY_TOKEN` (POST deploy only). HTTPS to `https://loom.grogan.dev` — no MCP.
 
+Self-deploy caveat: applying `loom` restarts the Loom service under the in-flight deploy request, so the first POST may return `409 origin.deploy_failed`. The host runs the apply in a transient systemd unit ([`deploy/loom-vm-apply`](deploy/loom-vm-apply), installed at `/usr/local/sbin/loom-vm-apply` on grid-01), so it finishes anyway; a single retry ~30 s later returns 200.
+
 **To finish in Automations editor:** pick the Origin repo, add both secrets, enable PR comments, set triggers to pull request merged **and** push to `main`, paste the matching prompt, save. Do not open the editor from chat until that draft is approved.
 
 **Origin UI (cannot be done from git):**

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Host helper: run Loom's apply.sh inside the loom VM as root, outside loom.service.
+# Invoked only via the restricted SSH key from 10.76.0.15.
+#
+# The apply restarts loom.service, which kills the Loom server that is awaiting
+# this SSH session; sshd then HUPs our session. Run the apply in a transient
+# systemd unit so it survives and finishes recording /var/lib/loom/applied-oid.
+# The caller's deploy retry then no-ops fast and reports success.
+set -euo pipefail
+OID="${1:?usage: loom-vm-apply <git-oid>}"
+exec systemd-run --quiet --collect --wait --unit "loom-apply-${OID:0:12}-$$" -- \
+  incus exec --project grid-trusted loom -- \
+  env LOOM_APPLY_INPLACE=1 /opt/loom/scripts/apply.sh "$OID"
