@@ -42,6 +42,6 @@ cargo build --release -p loom
 install -m 0755 target/release/loom "$PREFIX/bin/loom"
 install -m 0755 target/release/loom-git-hook "$PREFIX/bin/loom-git-hook"
 systemctl restart loom
-curl -fsS --retry 5 --retry-delay 1 --max-time 5 "$HEALTH_URL" >/dev/null
+curl -fsS --retry 10 --retry-connrefused --retry-delay 1 --max-time 5 "$HEALTH_URL" >/dev/null
 printf '%s\n' "$OID" >"$STATE"
 echo "loom apply: deployed $OID"
