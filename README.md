@@ -28,8 +28,13 @@ Origin webhook (Origin App signatures, not a bearer token):
 
 Owner bearer (`Authorization: Bearer $LOOM_TOKEN`) — features, CAS RPC, Git, `POST /v1/releases/{repo}/ci`, and evidence GET. `{repo}` is `loom`, `nero`, or `grid` (not `grogan-dev/…`). `{oid}` is a lowercase hex SHA (7–64 chars).
 
+Scoped tokens (owner-minted, for Grid workspaces / runners / agents; see [docs/platform.md](docs/platform.md)): `POST /v1/tokens` with `{ name, repositories, perms, expires_at? }` returns an `lt_…` secret once. Perms: `git` (gateway, Bearer or Basic password), `features` (create/read/candidates on bound repos; gates stay owner-only), `evidence` (release GET), `events` (reserved). `GET /v1/tokens` lists, `DELETE /v1/tokens/{id}` revokes immediately.
+
 | Method | Path | Role |
 | --- | --- | --- |
+| POST | `/v1/tokens` | mint a scoped token |
+| GET | `/v1/tokens` | list scoped tokens |
+| DELETE | `/v1/tokens/{id}` | revoke a scoped token |
 | GET | `/loom/v1/health` | CAS ready |
 | POST | `/loom/v1/source/commit` | native source mutation |
 | POST | `/loom/v1/source/materialize` | reconstruct a revision |

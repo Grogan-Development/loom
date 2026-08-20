@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Serialize;
 
@@ -20,6 +20,7 @@ use crate::ci::CiEngine;
 use crate::features::{CandidateSubmit, Feature, FeatureCreate, FeatureStore, promotion_updates};
 use crate::git::{GitBridge, GitHttpGateway};
 use crate::origin::{OriginCiRequest, OriginConfig, OriginEngine, OriginEvidence};
+use crate::tokens::{Authority, Principal, TokenMint, TokenPerm, TokenStore};
 use crate::{AtomicRefResult, LoomError, LoomRpc, NamespaceGrant, PersistentLoomStore};
 
 /// Runtime configuration for the combined Loom server.
@@ -45,6 +46,7 @@ pub struct ServerConfig {
 struct AppState {
     token: AccessToken,
     deploy_token: Option<AccessToken>,
+    authority: Authority,
     features: FeatureStore,
     ci: CiEngine,
     origin: OriginEngine,
@@ -67,6 +69,7 @@ impl LoomApp {
         let store = PersistentLoomStore::open(&config.root)?;
         let features = FeatureStore::new(store.clone());
         let ci = CiEngine::new(store.clone());
+        let authority = Authority::new(config.token.clone(), TokenStore::new(store.clone()));
         let token_state = TokenState(config.token.clone());
         let rpc = LoomRpc::new(store.clone())
             .router()
@@ -74,12 +77,13 @@ impl LoomApp {
         let git_router = GitBridge::new(store.clone(), &config.git_program, &config.hook_program)
             .map_or_else(
                 |_| Router::new(),
-                |bridge| GitHttpGateway::new(bridge, config.token.clone()).router(),
+                |bridge| GitHttpGateway::new(bridge, authority.clone()).router(),
             );
         let origin = OriginEngine::new(store.clone(), config.origin);
         let state = AppState {
             token: config.token,
             deploy_token: config.deploy_token,
+            authority,
             features,
             ci,
             origin,
@@ -87,6 +91,8 @@ impl LoomApp {
         };
         let api = Router::new()
             .route("/healthz", get(healthz))
+            .route("/v1/tokens", get(list_tokens).post(mint_token))
+            .route("/v1/tokens/{id}", delete(revoke_token))
             .route("/v1/features", get(list_features).post(create_feature))
             .route("/v1/features/{id}", get(get_feature))
             .route("/v1/features/{id}/approve", post(approve_feature))
@@ -269,8 +275,12 @@ async fn origin_get_release(
     headers: HeaderMap,
     AxumPath((repo, oid)): AxumPath<(String, String)>,
 ) -> Response {
-    if let Err(response) = require_token(&state, &headers) {
-        return *response;
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    if !principal.allows(TokenPerm::Evidence, [repo.as_str()]) {
+        return forbidden();
     }
     match state.origin.release(&repo, &oid) {
         Ok(Some(release)) => Json(OriginEvidence::from(&release)).into_response(),
@@ -330,12 +340,93 @@ struct ErrorBody {
     message: String,
 }
 
-async fn list_features(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// Resolves the caller to the owner or a live scoped token.
+fn resolve_principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, Box<Response>> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token)
+        .and_then(|secret| state.authority.resolve(secret))
+        .ok_or_else(|| Box::new(unauthorized()))
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            code: "loom.forbidden".to_owned(),
+            message: "token scope does not cover this repository set".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn feature_repositories(feature: &Feature) -> impl Iterator<Item = &str> {
+    feature
+        .repositories
+        .iter()
+        .map(|binding| binding.base.repository.as_str())
+}
+
+async fn mint_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<TokenMint>,
+) -> Response {
     if let Err(response) = require_token(&state, &headers) {
         return *response;
     }
+    match state.authority.tokens().mint(&request) {
+        Ok(minted) => (StatusCode::CREATED, Json(minted)).into_response(),
+        Err(LoomError::StorageUnavailable) => {
+            feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable")
+        }
+        Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "token.invalid"),
+    }
+}
+
+async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.authority.tokens().list() {
+        Ok(tokens) => Json(tokens).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
+    }
+}
+
+async fn revoke_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.authority.tokens().revoke(&id) {
+        Ok(removed) => Json(removed).into_response(),
+        Err(LoomError::UnknownToken { .. }) => {
+            feature_error(StatusCode::NOT_FOUND, "token.not_found")
+        }
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
+    }
+}
+
+async fn list_features(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     match state.features.list() {
-        Ok(features) => Json(features).into_response(),
+        Ok(features) => {
+            let visible = features
+                .into_iter()
+                .filter(|feature| {
+                    principal.allows(TokenPerm::Features, feature_repositories(feature))
+                })
+                .collect::<Vec<_>>();
+            Json(visible).into_response()
+        }
         Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
     }
 }
@@ -345,8 +436,18 @@ async fn create_feature(
     headers: HeaderMap,
     Json(request): Json<FeatureCreate>,
 ) -> Response {
-    if let Err(response) = require_token(&state, &headers) {
-        return *response;
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    if !principal.allows(
+        TokenPerm::Features,
+        request
+            .repositories
+            .iter()
+            .map(|binding| binding.base.repository.as_str()),
+    ) {
+        return forbidden();
     }
     match state.features.create(request) {
         Ok(feature) => (StatusCode::CREATED, Json(feature)).into_response(),
@@ -363,11 +464,18 @@ async fn get_feature(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Err(response) = require_token(&state, &headers) {
-        return *response;
-    }
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     match state.features.get(&id) {
-        Ok(feature) => Json(feature).into_response(),
+        Ok(feature) => {
+            if principal.allows(TokenPerm::Features, feature_repositories(&feature)) {
+                Json(feature).into_response()
+            } else {
+                forbidden()
+            }
+        }
         Err(_) => feature_error(StatusCode::NOT_FOUND, "feature.not_found"),
     }
 }
@@ -395,12 +503,23 @@ async fn submit_candidate(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<CandidateSubmit>,
 ) -> Response {
-    if let Err(response) = require_token(&state, &headers) {
-        return *response;
-    }
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     let Ok(feature) = state.features.get(&id) else {
         return feature_error(StatusCode::NOT_FOUND, "feature.not_found");
     };
+    let mut touched = feature_repositories(&feature).collect::<BTreeSet<_>>();
+    for binding in &request.repositories {
+        touched.insert(binding.base.repository.as_str());
+        if let Some(head) = &binding.head {
+            touched.insert(head.repository.as_str());
+        }
+    }
+    if !principal.allows(TokenPerm::Features, touched) {
+        return forbidden();
+    }
     if feature.gate != crate::features::FeatureGate::Approved {
         return feature_error(StatusCode::CONFLICT, "feature.invalid_transition");
     }

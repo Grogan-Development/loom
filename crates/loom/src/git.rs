@@ -12,8 +12,8 @@ use std::{
     sync::Arc,
 };
 
-use crate::auth::AccessToken;
 use crate::contracts::RepositoryRevision;
+use crate::tokens::{Authority, TokenPerm};
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -162,7 +162,7 @@ pub struct GitSshGateway {
 
 struct GitHttpState {
     bridge: GitBridge,
-    token: AccessToken,
+    authority: Authority,
 }
 
 impl fmt::Debug for GitHttpGateway {
@@ -170,17 +170,19 @@ impl fmt::Debug for GitHttpGateway {
         formatter
             .debug_struct("GitHttpGateway")
             .field("bridge", &self.state.bridge)
-            .field("token", &"[CONFIGURED]")
+            .field("authority", &"[CONFIGURED]")
             .finish()
     }
 }
 
 impl GitHttpGateway {
-    /// Creates a gateway that admits Git traffic with the owner bearer token.
+    /// Creates a gateway that admits Git traffic with the owner token or a
+    /// scoped token holding the `git` perm on the requested repository.
+    /// Credentials arrive as Bearer or as the password of HTTP Basic.
     #[must_use]
-    pub fn new(bridge: GitBridge, token: AccessToken) -> Self {
+    pub fn new(bridge: GitBridge, authority: Authority) -> Self {
         Self {
-            state: Arc::new(GitHttpState { bridge, token }),
+            state: Arc::new(GitHttpState { bridge, authority }),
         }
     }
 
@@ -712,7 +714,7 @@ async fn git_http_request(State(state): State<Arc<GitHttpState>>, request: Reque
     let Ok(parsed) = parse_http_request(&request) else {
         return git_http_error(StatusCode::BAD_REQUEST);
     };
-    if authenticate_git(&state, request.headers()).is_err() {
+    if authenticate_git(&state, request.headers(), &parsed.repository).is_err() {
         return git_http_error(StatusCode::UNAUTHORIZED);
     }
     let body = match to_bytes(request.into_body(), MAX_GIT_HTTP_BODY_BYTES).await {
@@ -786,13 +788,21 @@ fn parse_git_service(service: &str) -> Result<GitOperation, GitError> {
     }
 }
 
-fn authenticate_git(state: &GitHttpState, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let token = headers
+fn authenticate_git(
+    state: &GitHttpState,
+    headers: &HeaderMap,
+    repository: &str,
+) -> Result<(), StatusCode> {
+    let secret = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(crate::auth::bearer_token)
+        .and_then(crate::auth::presented_secret)
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if state.token.matches(token) {
+    let principal = state
+        .authority
+        .resolve(&secret)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if principal.allows(TokenPerm::Git, [repository]) {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)

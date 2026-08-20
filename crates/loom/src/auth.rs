@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use base64ct::{Base64, Encoding as _};
 use subtle::ConstantTimeEq;
 
 use crate::NamespaceGrant;
@@ -50,4 +51,29 @@ pub fn bearer_token(header: &str) -> Option<&str> {
         .strip_prefix("Bearer ")
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+}
+
+/// Extracts the password of a Basic Authorization header value.
+///
+/// Git credential helpers speak HTTP Basic: the password carries a Loom
+/// bearer secret and the username is ignored.
+#[must_use]
+pub fn basic_password(header: &str) -> Option<String> {
+    let encoded = header.strip_prefix("Basic ").map(str::trim)?;
+    let decoded = Base64::decode_vec(encoded).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (_, password) = text.split_once(':')?;
+    if password.is_empty() {
+        None
+    } else {
+        Some(password.to_owned())
+    }
+}
+
+/// Extracts a presented secret from either Bearer or Basic authorization.
+#[must_use]
+pub fn presented_secret(header: &str) -> Option<String> {
+    bearer_token(header)
+        .map(str::to_owned)
+        .or_else(|| basic_password(header))
 }

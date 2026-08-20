@@ -8,6 +8,7 @@ pub mod features;
 pub mod git;
 pub mod origin;
 pub mod server;
+pub mod tokens;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -156,6 +157,15 @@ pub enum LoomError {
     /// Origin git, check-run, or apply helper failed closed.
     #[error("origin execution is unavailable")]
     OriginUnavailable,
+    /// Scoped-token mint request failed its name, repository, perm, or expiry contract.
+    #[error("scoped token request is invalid")]
+    InvalidToken,
+    /// Scoped-token id does not exist in the catalog.
+    #[error("unknown scoped token: {id}")]
+    UnknownToken {
+        /// Requested token id.
+        id: String,
+    },
 }
 
 /// Repository namespace set attached to one authorized request.
