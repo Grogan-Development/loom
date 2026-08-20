@@ -128,3 +128,5 @@ These cannot be done from repo files:
 2. Set the App webhook to `https://loom.grogan.dev/v1/origin/webhook`. Loom verifies Origin App signatures (`webhook-id`, `webhook-timestamp`, `webhook-signature`). Do not put `LOOM_TOKEN` on the webhook.
 3. Under each repo **Settings → Rules and Protections**, require the check named **Loom** before merge (Origin upsert uses `suiteKey` `loom`, check `key` `ci`, `name` `Loom`).
 4. After DNS points `loom.grogan.dev` at the Loom VM (it may still be Railway), confirm webhook delivery and a Cloud CD dry comment.
+
+End-to-end validated: rulesets, secrets, and Cloud CD automations configured 2026-08-20.
