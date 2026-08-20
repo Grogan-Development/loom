@@ -1,0 +1,41 @@
+[package]
+name = "loom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Standalone smart repository: CAS source, feature contracts, lightning CI."
+
+[[bin]]
+name = "loom"
+path = "src/bin/loom.rs"
+
+[[bin]]
+name = "loom-git-hook"
+path = "src/bin/loom-git-hook.rs"
+
+[dependencies]
+axum.workspace = true
+base64ct.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true
