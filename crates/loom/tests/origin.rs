@@ -116,6 +116,28 @@ async fn webhook_accepts_signed_origin_payload() {
     assert_eq!(status, StatusCode::ACCEPTED);
 }
 
+/// Envelope and payload shapes exactly as Origin delivers them
+/// (deliveryId/appId wrapper, camelCase `pullRequest.head.sha`).
+#[test]
+fn webhook_targets_parse_origin_pull_request_shape() {
+    let body = format!(
+        r#"{{"deliveryId":"whd_1","appId":"app_1","installationId":"i_1","event":{{"id":"evt_1","type":"pull_request.created","payload":{{"pullRequest":{{"number":"1","head":{{"ref":"scratch/x","sha":"{OID}"}},"base":{{"ref":"main","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"version":{{"headSha":"{OID}"}}}},"repository":{{"name":"loom","owner":{{"slug":"grogan-dev"}}}}}}}}}}"#
+    );
+    let targets = loom::origin::OriginEngine::targets_from_webhook(body.as_bytes());
+    assert_eq!(targets, vec![("loom".to_owned(), OID.to_owned())]);
+}
+
+/// Origin push events carry a `refUpdates` array, not top-level `ref`/`after`.
+/// Only updates to `main` trigger CI; branch pushes and deletions do not.
+#[test]
+fn webhook_targets_parse_origin_ref_updates_shape() {
+    let body = format!(
+        r#"{{"deliveryId":"whd_2","appId":"app_1","installationId":"i_1","event":{{"id":"evt_2","type":"repository.pushed","payload":{{"repository":{{"name":"loom","owner":{{"slug":"grogan-dev"}}}},"refUpdates":[{{"ref":"refs/heads/scratch/x","before":"0000000000000000000000000000000000000000","after":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","created":true,"deleted":false}},{{"ref":"refs/heads/main","before":"cccccccccccccccccccccccccccccccccccccccc","after":"{OID}","created":false,"deleted":false}},{{"ref":"refs/heads/gone","after":"dddddddddddddddddddddddddddddddddddddddd","deleted":true}}]}}}}}}"#
+    );
+    let targets = loom::origin::OriginEngine::targets_from_webhook(body.as_bytes());
+    assert_eq!(targets, vec![("loom".to_owned(), OID.to_owned())]);
+}
+
 #[tokio::test]
 async fn deploy_is_rejected_without_passing_evidence_and_without_deploy_token() {
     let (_directory, router) = test_app(false, None);

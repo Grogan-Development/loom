@@ -830,30 +830,65 @@ fn extract_targets(event_type: &str, payload: &serde_json::Value) -> Vec<(String
     if repo.is_empty() || allowlisted(&repo).is_err() {
         return Vec::new();
     }
-    let sha = match event_type {
+    let shas: Vec<&str> = match event_type {
         "pull_request.created" | "pull_request.head_ref.pushed" | "pull_request.opened" => payload
             .pointer("/pullRequest/headSha")
+            .or_else(|| payload.pointer("/pullRequest/head/sha"))
+            .or_else(|| payload.pointer("/pullRequest/version/headSha"))
             .or_else(|| payload.pointer("/pull_request/head/sha"))
             .or_else(|| payload.pointer("/headSha"))
-            .and_then(serde_json::Value::as_str),
-        "repository.pushed" => {
-            let ref_name = payload
-                .get("ref")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if ref_name != "refs/heads/main" && ref_name != "main" {
-                return Vec::new();
-            }
-            payload.get("after").and_then(serde_json::Value::as_str)
-        }
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .collect(),
+        "repository.pushed" => main_push_heads(payload),
         _ => payload
             .pointer("/headSha")
             .or_else(|| payload.get("after"))
-            .and_then(serde_json::Value::as_str),
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .collect(),
     };
-    sha.filter(|value| validate_oid(value).is_ok())
-        .map(|value| vec![(repo, value.to_owned())])
-        .unwrap_or_default()
+    shas.into_iter()
+        .filter(|value| validate_oid(value).is_ok())
+        .map(|value| (repo.clone(), value.to_owned()))
+        .collect()
+}
+
+/// Head SHAs pushed to `main`. Origin delivers a `refUpdates` array; the
+/// GitHub-style top-level `ref`/`after` pair is kept as a fallback.
+fn main_push_heads(payload: &serde_json::Value) -> Vec<&str> {
+    if let Some(updates) = payload
+        .get("refUpdates")
+        .and_then(serde_json::Value::as_array)
+    {
+        return updates
+            .iter()
+            .filter(|update| {
+                let ref_name = update
+                    .get("ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let deleted = update
+                    .get("deleted")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                !deleted && (ref_name == "refs/heads/main" || ref_name == "main")
+            })
+            .filter_map(|update| update.get("after").and_then(serde_json::Value::as_str))
+            .collect();
+    }
+    let ref_name = payload
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if ref_name != "refs/heads/main" && ref_name != "main" {
+        return Vec::new();
+    }
+    payload
+        .get("after")
+        .and_then(serde_json::Value::as_str)
+        .into_iter()
+        .collect()
 }
 
 /// Builds a signed Origin webhook header set for tests.
