@@ -216,6 +216,13 @@ async fn origin_webhook(
     {
         return unauthorized();
     }
+    // Receipt log for verified deliveries: non-CI events (installation.*,
+    // pull_request.closed, ...) would otherwise leave no operational trace.
+    let excerpt: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
+    eprintln!(
+        "loom: origin webhook verified ({} bytes): {excerpt}",
+        body.len()
+    );
     let origin = state.origin.clone();
     let targets = OriginEngine::targets_from_webhook(&body);
     tokio::spawn(async move {
