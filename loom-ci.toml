@@ -1,0 +1,7 @@
+[ci]
+timeout_seconds = 600
+commands = [
+  ["cargo", "fmt", "--check"],
+  ["cargo", "clippy", "--locked", "-p", "loom", "--", "-D", "warnings"],
+  ["cargo", "test", "--locked", "-p", "loom"],
+]

@@ -20,6 +20,7 @@ path = "src/bin/loom-git-hook.rs"
 axum.workspace = true
 base64ct.workspace = true
 clap.workspace = true
+ed25519-dalek.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

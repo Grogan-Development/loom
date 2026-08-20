@@ -336,7 +336,26 @@ fn write_tree(
     Ok(())
 }
 
-fn pipeline_for(root: &Path) -> (Vec<Vec<String>>, Duration) {
+/// Loads `loom-ci.toml` from `root`, or the language-default pipeline.
+#[must_use]
+pub fn load_pipeline(root: &Path) -> (Vec<Vec<String>>, Duration) {
+    pipeline_for(root)
+}
+
+/// Runs one CI argv with a wall-clock timeout. The program name cannot contain `/`.
+///
+/// # Errors
+///
+/// Returns when the argv is empty, the program path is unsafe, or the process cannot be spawned.
+pub fn execute_command(
+    cwd: &Path,
+    command: &[String],
+    timeout: Duration,
+) -> Result<(bool, String), LoomError> {
+    run_command(cwd, command, timeout)
+}
+
+pub(crate) fn pipeline_for(root: &Path) -> (Vec<Vec<String>>, Duration) {
     let config_path = root.join("loom-ci.toml");
     if let Ok(bytes) = fs::read(&config_path)
         && let Ok(parsed) = toml::from_slice::<LoomCiFile>(&bytes)
@@ -366,7 +385,7 @@ fn pipeline_for(root: &Path) -> (Vec<Vec<String>>, Duration) {
     (commands, Duration::from_secs(DEFAULT_TIMEOUT_SECS))
 }
 
-fn run_command(
+pub(crate) fn run_command(
     cwd: &Path,
     command: &[String],
     timeout: Duration,
@@ -408,7 +427,7 @@ fn run_command(
     }
 }
 
-fn truncate_log(log: &str) -> String {
+pub(crate) fn truncate_log(log: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(log.as_bytes());
     if log.len() <= MAX_LOG_BYTES {

@@ -3,8 +3,10 @@
 pub mod auth;
 pub mod ci;
 pub mod contracts;
+pub mod deploy;
 pub mod features;
 pub mod git;
+pub mod origin;
 pub mod server;
 
 use std::{
@@ -137,6 +139,23 @@ pub enum LoomError {
         /// Repository-relative path whose ancestor is already a source entry.
         path: String,
     },
+    /// Origin SHA CI or deploy was requested for a repository Loom does not gate.
+    #[error("origin repository is not allowlisted: {repository}")]
+    OriginRepositoryDenied {
+        /// Rejected Origin repository name.
+        repository: String,
+    },
+    /// Deploy was refused because this exact SHA has no passing Loom evidence.
+    #[error("origin deploy is blocked for {repository}@{oid}")]
+    OriginDeployBlocked {
+        /// Origin repository name.
+        repository: String,
+        /// Requested git object id.
+        oid: String,
+    },
+    /// Origin git, check-run, or apply helper failed closed.
+    #[error("origin execution is unavailable")]
+    OriginUnavailable,
 }
 
 /// Repository namespace set attached to one authorized request.

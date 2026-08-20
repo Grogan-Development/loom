@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{DefaultBodyLimit, Path as AxumPath, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
@@ -18,6 +19,7 @@ use crate::auth::{AccessToken, bearer_token};
 use crate::ci::CiEngine;
 use crate::features::{CandidateSubmit, Feature, FeatureCreate, FeatureStore, promotion_updates};
 use crate::git::{GitBridge, GitHttpGateway};
+use crate::origin::{OriginCiRequest, OriginConfig, OriginEngine, OriginEvidence};
 use crate::{AtomicRefResult, LoomError, LoomRpc, NamespaceGrant, PersistentLoomStore};
 
 /// Runtime configuration for the combined Loom server.
@@ -27,8 +29,12 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     /// Absolute private dataset root.
     pub root: PathBuf,
-    /// Owner bearer token.
+    /// Owner bearer token. Authorizes features, CAS RPC, Git, CI, and evidence GET.
     pub token: AccessToken,
+    /// Deploy-only bearer token. Distinct from `token` unless tests set them equal.
+    pub deploy_token: Option<AccessToken>,
+    /// Origin clone, webhook, check-run, and apply configuration.
+    pub origin: OriginConfig,
     /// Absolute Git executable.
     pub git_program: PathBuf,
     /// Absolute pre-receive hook executable (`loom-git-hook`).
@@ -38,8 +44,10 @@ pub struct ServerConfig {
 #[derive(Clone)]
 struct AppState {
     token: AccessToken,
+    deploy_token: Option<AccessToken>,
     features: FeatureStore,
     ci: CiEngine,
+    origin: OriginEngine,
     store: PersistentLoomStore,
 }
 
@@ -68,10 +76,13 @@ impl LoomApp {
                 |_| Router::new(),
                 |bridge| GitHttpGateway::new(bridge, config.token.clone()).router(),
             );
+        let origin = OriginEngine::new(store.clone(), config.origin);
         let state = AppState {
             token: config.token,
+            deploy_token: config.deploy_token,
             features,
             ci,
+            origin,
             store,
         };
         let api = Router::new()
@@ -82,6 +93,13 @@ impl LoomApp {
             .route("/v1/features/{id}/candidates", post(submit_candidate))
             .route("/v1/features/{id}/accept", post(accept_feature))
             .route("/v1/features/{id}/reject", post(reject_feature))
+            .route("/v1/origin/webhook", post(origin_webhook))
+            .route("/v1/releases/{repo}/ci", post(origin_start_ci))
+            .route("/v1/releases/{repo}/{oid}", get(origin_get_release))
+            .route(
+                "/v1/releases/{repo}/{oid}/deploy",
+                post(origin_deploy_release),
+            )
             .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
             .with_state(state);
         let router = Router::new().merge(api).merge(rpc).nest("/git", git_router);
@@ -147,6 +165,135 @@ async fn healthz(State(state): State<AppState>) -> Response {
             }),
         )
             .into_response(),
+    }
+}
+
+fn require_deploy_token(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    let Some(expected) = state.deploy_token.as_ref() else {
+        return Err(Box::new(unauthorized()));
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    match presented {
+        Some(token) if expected.matches(token) => Ok(()),
+        _ => Err(Box::new(unauthorized())),
+    }
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorBody {
+            code: "loom.unauthorized".to_owned(),
+            message: "bearer token required".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+}
+
+async fn origin_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let webhook_id = header_str(&headers, "webhook-id");
+    let timestamp = header_str(&headers, "webhook-timestamp");
+    let signature = header_str(&headers, "webhook-signature");
+    if state
+        .origin
+        .verify_webhook(webhook_id, timestamp, signature, &body)
+        .await
+        .is_err()
+    {
+        return unauthorized();
+    }
+    let origin = state.origin.clone();
+    let targets = OriginEngine::targets_from_webhook(&body);
+    tokio::spawn(async move {
+        for (repository, oid) in targets {
+            let job = origin.clone();
+            match tokio::task::spawn_blocking(move || job.run_ci(&repository, &oid)).await {
+                Ok(Ok(release)) => origin.publish_check(&release).await,
+                Ok(Err(error)) => eprintln!("loom: origin webhook ci failed: {error}"),
+                Err(error) => eprintln!("loom: origin webhook join failed: {error}"),
+            }
+        }
+    });
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn origin_start_ci(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(repo): AxumPath<String>,
+    Json(request): Json<OriginCiRequest>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let origin = state.origin.clone();
+    match tokio::task::spawn_blocking(move || origin.run_ci(&repo, &request.git_oid)).await {
+        Ok(Ok(release)) => {
+            state.origin.publish_check(&release).await;
+            Json(OriginEvidence::from(&release)).into_response()
+        }
+        Ok(Err(LoomError::OriginRepositoryDenied { .. })) => {
+            feature_error(StatusCode::NOT_FOUND, "origin.repository_denied")
+        }
+        Ok(Err(LoomError::InvalidSourceCommit)) => {
+            feature_error(StatusCode::UNPROCESSABLE_ENTITY, "origin.oid_invalid")
+        }
+        Ok(Err(_)) => feature_error(StatusCode::CONFLICT, "origin.ci_failed"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "origin.unavailable"),
+    }
+}
+
+async fn origin_get_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((repo, oid)): AxumPath<(String, String)>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.origin.release(&repo, &oid) {
+        Ok(Some(release)) => Json(OriginEvidence::from(&release)).into_response(),
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "origin.release_missing"),
+        Err(LoomError::OriginRepositoryDenied { .. }) => {
+            feature_error(StatusCode::NOT_FOUND, "origin.repository_denied")
+        }
+        Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "origin.oid_invalid"),
+    }
+}
+
+async fn origin_deploy_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((repo, oid)): AxumPath<(String, String)>,
+) -> Response {
+    if let Err(response) = require_deploy_token(&state, &headers) {
+        return *response;
+    }
+    let origin = state.origin.clone();
+    match tokio::task::spawn_blocking(move || origin.deploy(&repo, &oid)).await {
+        Ok(Ok(release)) => Json(OriginEvidence::from(&release)).into_response(),
+        Ok(Err(LoomError::OriginDeployBlocked { .. })) => {
+            feature_error(StatusCode::CONFLICT, "origin.deploy_blocked")
+        }
+        Ok(Err(LoomError::OriginRepositoryDenied { .. })) => {
+            feature_error(StatusCode::NOT_FOUND, "origin.repository_denied")
+        }
+        Ok(Err(_)) => feature_error(StatusCode::CONFLICT, "origin.deploy_failed"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "origin.unavailable"),
     }
 }
 

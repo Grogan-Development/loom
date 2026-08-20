@@ -2,13 +2,22 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use loom::auth::AccessToken;
+use loom::origin::OriginConfig;
 use loom::server::{LoomApp, ServerConfig};
 
 #[derive(Debug, Parser)]
-#[command(name = "loom", version, about = "Standalone Loom smart repository")]
+#[command(
+    name = "loom",
+    version,
+    about = "Standalone Loom smart repository",
+    long_about = "Owner token (LOOM_TOKEN) authorizes /v1/releases/*/ci, GET evidence, features, CAS RPC, and Git.\n\
+Deploy token (LOOM_DEPLOY_TOKEN) authorizes only POST /v1/releases/{repo}/{oid}/deploy.\n\
+Origin webhooks are authenticated by Origin App signatures, not bearer tokens."
+)]
 struct Cli {
     /// Listen address. Docker images default to `0.0.0.0:8080`.
     #[arg(long, env = "LOOM_BIND", default_value = "0.0.0.0:8080")]
@@ -16,9 +25,12 @@ struct Cli {
     /// Absolute private dataset root.
     #[arg(long, env = "LOOM_ROOT")]
     root: PathBuf,
-    /// Owner bearer token.
+    /// Owner bearer token (`Authorization: Bearer`). CI start and evidence GET.
     #[arg(long, env = "LOOM_TOKEN")]
     token: String,
+    /// Deploy-only bearer token. Required for POST /v1/releases/{repo}/{oid}/deploy.
+    #[arg(long, env = "LOOM_DEPLOY_TOKEN")]
+    deploy_token: Option<String>,
     /// Absolute Git executable.
     #[arg(long, env = "LOOM_GIT_PROGRAM", default_value = "/usr/bin/git")]
     git_program: PathBuf,
@@ -29,6 +41,54 @@ struct Cli {
         default_value = "/usr/local/bin/loom-git-hook"
     )]
     hook_program: PathBuf,
+    /// Scratch directory for Origin mirrors and worktrees.
+    #[arg(long, env = "ORIGIN_WORKDIR")]
+    origin_workdir: Option<PathBuf>,
+    /// Origin owner slug. Defaults to grogan-dev.
+    #[arg(long, env = "ORIGIN_OWNER")]
+    origin_owner: Option<String>,
+    /// Origin git HTTPS host. Defaults to origin.cursor.com.
+    #[arg(long, env = "ORIGIN_CLONE_HOST")]
+    origin_clone_host: Option<String>,
+    /// Origin REST base including `/v1/origin`.
+    #[arg(long, env = "ORIGIN_API_BASE")]
+    origin_api_base: Option<String>,
+    /// HTTPS clone token (`x-access-token`). Installation tokens are used when empty.
+    #[arg(long, env = "ORIGIN_CLONE_TOKEN")]
+    origin_clone_token: Option<String>,
+    /// Origin App id (`iss` / `kid` for check-run JWTs).
+    #[arg(long, env = "ORIGIN_APP_ID")]
+    origin_app_id: Option<String>,
+    /// PKCS#8 Ed25519 PEM for the Origin App (not committed).
+    #[arg(long, env = "ORIGIN_APP_PRIVATE_KEY")]
+    origin_app_private_key: Option<String>,
+    /// File containing the Origin App PKCS#8 Ed25519 PEM.
+    #[arg(long, env = "ORIGIN_APP_PRIVATE_KEY_FILE")]
+    origin_app_private_key_file: Option<PathBuf>,
+    /// Origin App installation id.
+    #[arg(long, env = "ORIGIN_INSTALLATION_ID")]
+    origin_installation_id: Option<String>,
+    /// Local apply script for the Loom VM.
+    #[arg(long, env = "ORIGIN_LOOM_APPLY")]
+    origin_loom_apply: Option<PathBuf>,
+    /// Remote apply script for Grid.
+    #[arg(long, env = "ORIGIN_GRID_APPLY")]
+    origin_grid_apply: Option<PathBuf>,
+    /// Remote apply script for Nero.
+    #[arg(long, env = "ORIGIN_NERO_APPLY")]
+    origin_nero_apply: Option<PathBuf>,
+    /// SSH host for Grid and Nero applies (typically grid-01).
+    #[arg(long, env = "ORIGIN_DEPLOY_SSH_HOST")]
+    origin_deploy_ssh_host: Option<String>,
+    /// SSH user for Grid and Nero applies.
+    #[arg(long, env = "ORIGIN_DEPLOY_SSH_USER")]
+    origin_deploy_ssh_user: Option<String>,
+    /// SSH identity file for Grid and Nero applies.
+    #[arg(long, env = "ORIGIN_DEPLOY_SSH_KEY")]
+    origin_deploy_ssh_key: Option<PathBuf>,
+    /// Wall-clock timeout in seconds for apply helpers.
+    #[arg(long, env = "ORIGIN_APPLY_TIMEOUT_SECS")]
+    origin_apply_timeout_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -43,10 +103,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.token.is_empty() {
         return Err("LOOM_TOKEN is required".into());
     }
+    let origin = origin_config(&cli)?;
+    let deploy_token = cli
+        .deploy_token
+        .filter(|value| !value.is_empty())
+        .map(AccessToken::new);
     let app = LoomApp::new(ServerConfig {
         bind: cli.bind,
         root: cli.root,
         token: AccessToken::new(cli.token),
+        deploy_token,
+        origin,
         git_program: cli.git_program,
         hook_program: cli.hook_program,
     })?;
@@ -55,6 +122,59 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+fn origin_config(cli: &Cli) -> Result<OriginConfig, Box<dyn std::error::Error>> {
+    let workdir = cli
+        .origin_workdir
+        .clone()
+        .unwrap_or_else(|| cli.root.join("origin-work"));
+    let mut origin = OriginConfig::production(workdir, cli.git_program.clone());
+    if let Some(owner) = &cli.origin_owner {
+        origin.owner.clone_from(owner);
+    }
+    if let Some(host) = &cli.origin_clone_host {
+        origin.clone_host.clone_from(host);
+    }
+    if let Some(api_base) = &cli.origin_api_base {
+        origin.api_base.clone_from(api_base);
+    }
+    if let Some(token) = &cli.origin_clone_token {
+        origin.clone_token = Some(token.clone());
+    }
+    if let Some(app_id) = &cli.origin_app_id {
+        origin.app_id = Some(app_id.clone());
+    }
+    if let Some(path) = &cli.origin_app_private_key_file {
+        origin.app_private_key_pem = Some(std::fs::read_to_string(path)?);
+    } else if let Some(pem) = &cli.origin_app_private_key {
+        origin.app_private_key_pem = Some(pem.clone());
+    }
+    if let Some(installation_id) = &cli.origin_installation_id {
+        origin.installation_id = Some(installation_id.clone());
+    }
+    if let Some(path) = &cli.origin_loom_apply {
+        origin.loom_apply.clone_from(path);
+    }
+    if let Some(path) = &cli.origin_grid_apply {
+        origin.grid_apply.clone_from(path);
+    }
+    if let Some(path) = &cli.origin_nero_apply {
+        origin.nero_apply.clone_from(path);
+    }
+    if let Some(host) = &cli.origin_deploy_ssh_host {
+        origin.deploy_ssh_host = Some(host.clone());
+    }
+    if let Some(user) = &cli.origin_deploy_ssh_user {
+        origin.deploy_ssh_user = Some(user.clone());
+    }
+    if let Some(key) = &cli.origin_deploy_ssh_key {
+        origin.deploy_ssh_key = Some(key.clone());
+    }
+    if let Some(seconds) = cli.origin_apply_timeout_secs {
+        origin.apply_timeout = Duration::from_secs(seconds);
+    }
+    Ok(origin)
 }
 
 async fn shutdown_signal() {
