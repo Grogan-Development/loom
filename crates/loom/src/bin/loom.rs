@@ -124,33 +124,45 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Empty environment values (e.g. `ORIGIN_APP_ID=` in an `EnvironmentFile`)
+/// must behave exactly like unset ones.
+fn non_empty(value: Option<&String>) -> Option<&String> {
+    value.filter(|item| !item.is_empty())
+}
+
 fn origin_config(cli: &Cli) -> Result<OriginConfig, Box<dyn std::error::Error>> {
     let workdir = cli
         .origin_workdir
         .clone()
         .unwrap_or_else(|| cli.root.join("origin-work"));
     let mut origin = OriginConfig::production(workdir, cli.git_program.clone());
-    if let Some(owner) = &cli.origin_owner {
+    if let Some(owner) = non_empty(cli.origin_owner.as_ref()) {
         origin.owner.clone_from(owner);
     }
-    if let Some(host) = &cli.origin_clone_host {
+    if let Some(host) = non_empty(cli.origin_clone_host.as_ref()) {
         origin.clone_host.clone_from(host);
     }
-    if let Some(api_base) = &cli.origin_api_base {
+    if let Some(api_base) = non_empty(cli.origin_api_base.as_ref()) {
         origin.api_base.clone_from(api_base);
     }
-    if let Some(token) = &cli.origin_clone_token {
+    if let Some(token) = non_empty(cli.origin_clone_token.as_ref()) {
         origin.clone_token = Some(token.clone());
     }
-    if let Some(app_id) = &cli.origin_app_id {
+    if let Some(app_id) = non_empty(cli.origin_app_id.as_ref()) {
         origin.app_id = Some(app_id.clone());
     }
     if let Some(path) = &cli.origin_app_private_key_file {
-        origin.app_private_key_pem = Some(std::fs::read_to_string(path)?);
-    } else if let Some(pem) = &cli.origin_app_private_key {
+        let pem = std::fs::read_to_string(path)?;
+        if !pem.trim().is_empty() {
+            origin.app_private_key_pem = Some(pem);
+        }
+    }
+    if origin.app_private_key_pem.is_none()
+        && let Some(pem) = non_empty(cli.origin_app_private_key.as_ref())
+    {
         origin.app_private_key_pem = Some(pem.clone());
     }
-    if let Some(installation_id) = &cli.origin_installation_id {
+    if let Some(installation_id) = non_empty(cli.origin_installation_id.as_ref()) {
         origin.installation_id = Some(installation_id.clone());
     }
     if let Some(path) = &cli.origin_loom_apply {
@@ -162,10 +174,10 @@ fn origin_config(cli: &Cli) -> Result<OriginConfig, Box<dyn std::error::Error>> 
     if let Some(path) = &cli.origin_nero_apply {
         origin.nero_apply.clone_from(path);
     }
-    if let Some(host) = &cli.origin_deploy_ssh_host {
+    if let Some(host) = non_empty(cli.origin_deploy_ssh_host.as_ref()) {
         origin.deploy_ssh_host = Some(host.clone());
     }
-    if let Some(user) = &cli.origin_deploy_ssh_user {
+    if let Some(user) = non_empty(cli.origin_deploy_ssh_user.as_ref()) {
         origin.deploy_ssh_user = Some(user.clone());
     }
     if let Some(key) = &cli.origin_deploy_ssh_key {

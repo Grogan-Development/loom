@@ -425,9 +425,11 @@ impl OriginEngine {
             )?;
             rewrite_remote(&self.config.git_program, &mirror, &self.config, repository)?;
         }
+        // Fetch through the token URL, not the named remote: rewrite_remote
+        // deliberately strips credentials from the persisted remote.
         git(
             &self.config.git_program,
-            &["fetch", "--force", "origin", oid],
+            &["fetch", "--force", &url, oid],
             &mirror,
         )?;
         let work = self.config.workdir.join(format!("work-{repository}-{oid}"));
