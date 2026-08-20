@@ -11,6 +11,8 @@ use ed25519_dalek::pkcs8::DecodePrivateKey as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::ci::{CiStatus, execute_command, load_pipeline, truncate_log};
@@ -383,11 +385,23 @@ impl OriginEngine {
             );
             return;
         }
-        if let Err(error) = self.upsert_check(release).await {
-            eprintln!(
+        match self.upsert_check(release).await {
+            Ok(check_id) => {
+                if check_id.is_some() && check_id != release.origin_check_id {
+                    let mut updated = release.clone();
+                    updated.origin_check_id = check_id;
+                    if let Err(error) = self.upsert(updated) {
+                        eprintln!(
+                            "loom: origin check id store failed for {}@{}: {error}",
+                            release.repository, release.git_oid
+                        );
+                    }
+                }
+            }
+            Err(error) => eprintln!(
                 "loom: origin check upsert failed for {}@{}: {error}",
                 release.repository, release.git_oid
-            );
+            ),
         }
     }
 
@@ -478,42 +492,49 @@ impl OriginEngine {
             .collect()
     }
 
-    async fn upsert_check(&self, release: &OriginRelease) -> Result<(), LoomError> {
+    /// Upserts the Loom check on Origin and returns the check-run id.
+    ///
+    /// Verified request shape (Origin returns 400 field violations otherwise):
+    /// repo-scoped route, top-level `headSha`, a `checkSuite` with `key`,
+    /// `name`, and `externalId`, and RFC 3339 `externalUpdatedAt`.
+    async fn upsert_check(&self, release: &OriginRelease) -> Result<Option<String>, LoomError> {
         let token = self.installation_token().await?;
         let in_progress = matches!(release.status, CiStatus::Running | CiStatus::Pending);
-        let conclusion = if release.tests_passed {
-            "success"
-        } else if in_progress {
-            "neutral"
-        } else {
-            "failure"
-        };
-        let status = if in_progress {
-            "in_progress"
-        } else {
-            "completed"
-        };
+        let updated_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| LoomError::OriginUnavailable)?;
+        let mut check_run = serde_json::json!({
+            "key": "ci",
+            "name": "Loom",
+            "status": if in_progress { "in_progress" } else { "completed" },
+            "externalId": release.job_id,
+            "externalUpdatedAt": updated_at,
+            "output": {
+                "title": "Loom CI",
+                "summary": release.log
+            }
+        });
+        if !in_progress {
+            check_run["conclusion"] = serde_json::json!(if release.tests_passed {
+                "success"
+            } else {
+                "failure"
+            });
+        }
         let body = serde_json::json!({
-            "owner": self.config.owner,
-            "repo": release.repository,
-            "checkRuns": [{
-                "headSha": release.git_oid,
-                "suiteKey": "loom",
-                "key": "ci",
+            "headSha": release.git_oid,
+            "checkSuite": {
+                "key": "loom",
                 "name": "Loom",
-                "status": status,
-                "conclusion": conclusion,
-                "externalId": release.job_id,
-                "externalUpdatedAt": unix_now().to_string(),
-                "output": {
-                    "title": "Loom CI",
-                    "summary": release.log
-                }
-            }]
+                "externalId": release.job_id
+            },
+            "checkRuns": [check_run]
         });
         let url = format!(
-            "{}/check-runs:batchUpsert",
-            self.config.api_base.trim_end_matches('/')
+            "{}/repos/{}/{}/check-runs:batchUpsert",
+            self.config.api_base.trim_end_matches('/'),
+            self.config.owner,
+            release.repository
         );
         let response = self
             .http
@@ -523,11 +544,17 @@ impl OriginEngine {
             .send()
             .await
             .map_err(|_| LoomError::OriginUnavailable)?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(LoomError::OriginUnavailable)
+        if !response.status().is_success() {
+            return Err(LoomError::OriginUnavailable);
         }
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| LoomError::OriginUnavailable)?;
+        Ok(value
+            .pointer("/checkRuns/0/id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned))
     }
 
     async fn installation_token(&self) -> Result<String, LoomError> {
