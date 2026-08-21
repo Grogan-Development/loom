@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "loom-cli",
+    name = "loom",
+    version,
     about = "Call the standalone Loom HTTP API using LOOM_URL and LOOM_TOKEN"
 )]
 struct Cli {
@@ -137,7 +138,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    let cli = Cli::parse();
+    // Cargo builds this package as `loom-cli` so the host can keep `loom` for
+    // the server. Grid exposes the client as `loom`; pin argv[0] so help and
+    // errors use that stable guest-facing identity through either alias.
+    let cli = Cli::parse_from(
+        std::iter::once(std::ffi::OsString::from("loom")).chain(std::env::args_os().skip(1)),
+    );
     let api = Api::from_env()?;
     match cli.command {
         Command::Events {

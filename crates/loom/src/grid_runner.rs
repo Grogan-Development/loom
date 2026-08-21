@@ -7,10 +7,20 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 /// Configured Grid runner backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GridRunner {
     base_url: String,
     token: String,
+}
+
+impl std::fmt::Debug for GridRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GridRunner")
+            .field("base_url", &self.base_url)
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 /// One repository revision to materialize inside the runner VM.
@@ -100,6 +110,26 @@ impl std::fmt::Display for GridRunnerError {
 }
 
 impl GridRunner {
+    /// Creates a Grid runner client from an explicit service URL and internal token.
+    ///
+    /// # Errors
+    ///
+    /// Returns when either value is empty.
+    pub fn new(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, GridRunnerError> {
+        let base_url = base_url.into();
+        let token = token.into();
+        if base_url.trim().is_empty() || token.is_empty() {
+            return Err(GridRunnerError::NotConfigured);
+        }
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            token,
+        })
+    }
+
     /// Reads `LOOM_GRID_URL` and `LOOM_GRID_INTERNAL_TOKEN`.
     ///
     /// # Errors
@@ -110,13 +140,7 @@ impl GridRunner {
             std::env::var("LOOM_GRID_URL").map_err(|_| GridRunnerError::NotConfigured)?;
         let token = std::env::var("LOOM_GRID_INTERNAL_TOKEN")
             .map_err(|_| GridRunnerError::NotConfigured)?;
-        if base_url.is_empty() || token.is_empty() {
-            return Err(GridRunnerError::NotConfigured);
-        }
-        Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            token,
-        })
+        Self::new(base_url, token)
     }
 
     /// Submits a runner job.

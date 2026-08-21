@@ -34,6 +34,8 @@ pub enum TokenPerm {
     Features,
     /// Release and CI evidence reads.
     Evidence,
+    /// Review lifecycle writes without candidate, patch-apply, or promotion authority.
+    Review,
     /// Event stream reads.
     Events,
 }

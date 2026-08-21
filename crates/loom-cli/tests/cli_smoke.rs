@@ -1,4 +1,4 @@
-//! Smoke the loom-cli binary against a live Loom router.
+//! Smoke the user-facing `loom` command against a live Loom router.
 #![allow(clippy::unwrap_used, missing_docs)]
 
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ fn test_app() -> (tempfile::TempDir, axum::Router) {
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/bin/true"),
+        review_runner: None,
     })
     .unwrap();
     (directory, app.router())
@@ -30,6 +31,19 @@ fn test_app() -> (tempfile::TempDir, axum::Router) {
 
 fn loom_cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_loom-cli"))
+}
+
+fn run_help(args: &[&str]) -> (bool, String) {
+    let output = loom_cli()
+        .env_remove("LOOM_URL")
+        .env_remove("LOOM_TOKEN")
+        .args(args)
+        .arg("--help")
+        .output()
+        .unwrap();
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
 }
 
 async fn run_cli(url: &str, args: &[&str]) -> (bool, String) {
@@ -50,9 +64,47 @@ async fn run_cli(url: &str, args: &[&str]) -> (bool, String) {
     .unwrap()
 }
 
+#[test]
+fn documented_command_shapes_parse_and_use_the_stable_name() {
+    let (ok, top_level) = run_help(&[]);
+    assert!(ok, "top-level help should succeed: {top_level}");
+    assert!(top_level.contains("Usage: loom <COMMAND>"), "{top_level}");
+
+    // These are the high-value command forms baked into Grid's Nero skills.
+    // Appending --help validates Clap's exact option/argument grammar without
+    // requiring credentials or making an HTTP request.
+    let cases: &[&[&str]] = &[
+        &["feature", "create", "--file", "/tmp/feature.json"],
+        &["feature", "list"],
+        &["feature", "show", "feature-id"],
+        &["feature", "approve", "feature-id"],
+        &["feature", "accept", "feature-id"],
+        &["feature", "reject", "feature-id"],
+        &[
+            "candidate",
+            "submit",
+            "--feature",
+            "feature-id",
+            "--file",
+            "/tmp/candidate.json",
+        ],
+        &["evidence", "--feature", "feature-id"],
+        &["insights", "--feature", "feature-id"],
+        &["review", "list", "--feature", "feature-id"],
+        &["review", "apply", "--feature", "feature-id", "finding-id"],
+        &["comment", "--feature", "feature-id", "--body", "looks good"],
+        &["events", "--follow", "--feature", "feature-id"],
+        &["status"],
+    ];
+    for args in cases {
+        let (ok, text) = run_help(args);
+        assert!(ok, "`loom {}` should parse: {text}", args.join(" "));
+    }
+}
+
 #[tokio::test]
-async fn comment_and_review_apply_hit_real_routes() {
-    let (_directory, router) = test_app();
+async fn documented_reads_comments_and_review_apply_hit_real_routes() {
+    let (directory, router) = test_app();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -61,29 +113,50 @@ async fn comment_and_review_apply_hit_real_routes() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let url = format!("http://{addr}");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap();
-    let created = client
-        .post(format!("{url}/v1/features"))
-        .bearer_auth(OWNER)
-        .json(&serde_json::json!({
+    let feature_file = directory.path().join("feature.json");
+    std::fs::write(
+        &feature_file,
+        serde_json::to_vec(&serde_json::json!({
             "title": "cli smoke",
             "repositories": [{
                 "base": { "repository": "demo", "revision": REVISION },
+                "head": null,
                 "target_ref": "refs/main",
             }],
             "scenarios": [{
                 "name": "s", "given": "g", "when": "w", "then": "t",
             }],
         }))
-        .send()
-        .await
-        .unwrap();
-    assert!(created.status().is_success(), "{}", created.status());
-    let feature: serde_json::Value = created.json().await.unwrap();
+        .unwrap(),
+    )
+    .unwrap();
+    let (ok, text) = run_cli(
+        &url,
+        &[
+            "feature",
+            "create",
+            "--file",
+            feature_file.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(ok, "feature create should succeed: {text}");
+    let feature: serde_json::Value = serde_json::from_str(&text).unwrap();
     let feature_id = feature["id"].as_str().unwrap();
+
+    for args in [
+        vec!["feature", "list"],
+        vec!["feature", "show", feature_id],
+        vec!["feature", "approve", feature_id],
+        vec!["evidence", "--feature", feature_id],
+        vec!["insights", "--feature", feature_id],
+        vec!["review", "list", "--feature", feature_id],
+        vec!["events", "--feature", feature_id],
+        vec!["status"],
+    ] {
+        let (ok, text) = run_cli(&url, &args).await;
+        assert!(ok, "`loom {}` should succeed: {text}", args.join(" "));
+    }
 
     let (ok, text) = run_cli(
         &url,

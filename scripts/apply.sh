@@ -12,6 +12,7 @@ ROOT="${LOOM_APPLY_ROOT:-/opt/loom}"
 STATE="${LOOM_APPLY_STATE:-/var/lib/loom/applied-oid}"
 PREFIX="${LOOM_INSTALL_PREFIX:-/usr/local}"
 HEALTH_URL="${LOOM_HEALTH_URL:-http://127.0.0.1:8080/healthz}"
+GRID_CLI="${LOOM_GRID_CLI_PATH:-${PREFIX}/libexec/grid/loom}"
 
 # Invoked from sandboxed loom.service, hop to grid-01 and incus-exec back
 # so `systemctl restart loom` does not kill this process with the unit.
@@ -38,9 +39,21 @@ cd "$ROOT"
 export GIT_TERMINAL_PROMPT=0
 git fetch --force origin "$OID"
 git checkout --detach "$OID"
-cargo build --release -p loom
-install -m 0755 target/release/loom "$PREFIX/bin/loom"
-install -m 0755 target/release/loom-git-hook "$PREFIX/bin/loom-git-hook"
+# Build artifacts live outside the checkout so target/ cannot fill the small
+# volume that holds /opt. CARGO_HOME already lives under /var/lib/loom.
+export CARGO_TARGET_DIR="${LOOM_CARGO_TARGET_DIR:-/var/lib/loom/target}"
+mkdir -p "$CARGO_TARGET_DIR"
+cargo build --release -p loom -p loom-cli
+install -m 0755 "$CARGO_TARGET_DIR/release/loom" "$PREFIX/bin/loom"
+install -m 0755 "$CARGO_TARGET_DIR/release/loom-git-hook" "$PREFIX/bin/loom-git-hook"
+# The host's `loom` name belongs to the server. Export the client under a
+# Grid-only path; Grid installs it into guests as `loom` with a `loom-cli`
+# compatibility alias.
+install -d -m 0755 "$(dirname "$GRID_CLI")"
+install -m 0755 "$CARGO_TARGET_DIR/release/loom-cli" "$GRID_CLI"
+# One-time reclaim of the in-tree target dir from applies before the
+# CARGO_TARGET_DIR isolation above.
+rm -rf "$ROOT/target"
 systemctl restart loom
 curl -fsS --retry 10 --retry-connrefused --retry-delay 1 --max-time 5 "$HEALTH_URL" >/dev/null
 printf '%s\n' "$OID" >"$STATE"

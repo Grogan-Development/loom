@@ -282,6 +282,24 @@ impl ReviewStore {
         Ok(reviews)
     }
 
+    /// Loads one review while enforcing its feature binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the review is absent, belongs to a different feature, or
+    /// durable state cannot be read.
+    pub fn get(&self, feature_id: &str, review_id: &str) -> Result<Review, LoomError> {
+        let lock = self.store.shared_lock()?;
+        let reviews = self.load_reviews()?;
+        let review = reviews
+            .get(review_id)
+            .filter(|review| review.feature_id == feature_id)
+            .cloned()
+            .ok_or_else(|| unknown_review(review_id))?;
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(review)
+    }
+
     /// Appends findings to an existing review.
     ///
     /// # Errors
@@ -340,6 +358,14 @@ impl ReviewStore {
             .ok_or_else(|| unknown_review(review_id))?;
         if review.feature_id != feature_id {
             return Err(unknown_review(review_id));
+        }
+        if review.status == ReviewStatus::Completed {
+            if review.verdict == Some(request.verdict) {
+                let result = review.clone();
+                File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+                return Ok(result);
+            }
+            return Err(LoomError::InvalidSourceCommit);
         }
         review.status = ReviewStatus::Completed;
         review.verdict = Some(request.verdict);
@@ -498,8 +524,9 @@ impl ReviewStore {
 
     /// Returns whether Gate 2 accept may proceed under a blocking review policy.
     ///
-    /// True when no review exists or the latest completed review approved.
-    /// False when a review is pending or the latest verdict is not approve.
+    /// True only when at least one review exists, every review is completed,
+    /// and the latest verdict approved. Missing or pending review state fails
+    /// closed.
     /// Storage failures fail closed (`false`).
     #[must_use]
     pub fn blocking_ok(&self, feature_id: &str) -> bool {
@@ -509,7 +536,7 @@ impl ReviewStore {
     fn blocking_status(&self, feature_id: &str) -> Result<bool, LoomError> {
         let mut reviews = self.list_for_feature(feature_id)?;
         if reviews.is_empty() {
-            return Ok(true);
+            return Ok(false);
         }
         if reviews
             .iter()

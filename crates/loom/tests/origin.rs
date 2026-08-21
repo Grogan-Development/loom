@@ -45,6 +45,7 @@ fn test_app(passed: bool, webhook_secret: Option<[u8; 32]>) -> (tempfile::TempDi
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/bin/true"),
+        review_runner: None,
     })
     .unwrap();
     (directory, app.router())

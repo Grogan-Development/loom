@@ -156,8 +156,10 @@ Today Loom has one owner token and one deploy token. Added:
   expires_at }` -> `lt_...` secret. `DELETE /v1/tokens/{id}` revokes.
   Stored hashed in `tokens.json` under the store lock.
 - Perms: `git` (gateway read/write within writable-ref rules), `features`
-  (create/comment/candidates on bound repos), `evidence` (read CI/insights/
-  review results), `events` (SSE), `admin`-only stays owner.
+  (create/candidates and approved-patch apply on bound repos), `evidence`
+  (read CI/insights/review results), `review` (feature read plus findings,
+  verdicts, and agent comments, with no candidate/apply/promotion authority),
+  `events` (SSE), `admin`-only stays owner.
 - The git gateway and feature/evidence routes accept scoped tokens and
   enforce the repo set; the owner token keeps working everywhere. Deploy
   token semantics unchanged.
@@ -249,8 +251,11 @@ Unlike default Nero, review Nero never lands changes directly:
   candidate) via `loom review apply <finding>`. Approval applies the
   mutations as a new commit on the candidate branch and re-triggers the
   pipeline (CI + insights re-run; caches make unchanged repos cheap).
-- Its runner token is scoped to `features` + `evidence` on the bound repos
-  only — it cannot push, accept, or touch protected refs.
+- Its short-lived runner token is scoped to `review` + `evidence` on the bound
+  repos only — it cannot submit candidates, approve/apply findings, push,
+  accept, or touch protected refs. Grid additionally removes workspace sudo,
+  makes materialized source read-only, and rejects non-headless or
+  permission-bypassing review commands.
 
 ## 7. Events: Loom is the pulse
 
@@ -338,6 +343,50 @@ because the surface is files in `.agents/` plus a CLI.
   fail-closed, idempotent — unchanged shape) applies via the existing
   `scripts/apply.sh` path, using the git-mapping OID for checkout. Optionally
   auto-deploy on accept per repo. Cursor Cloud CD automations retire.
+
+## 11. The platform workshop (Grid `kind=platform`)
+
+"Branches are durable, workspaces are cattle" is right for user VMs and wrong
+for the one place that dogfoods the platform. Grid adds a third workspace
+kind, `platform`, with exactly one row: **`ws-platform`**, owned by the admin
+user, bound to the `Platform` project (`grid`, `loom`, `nero`) on the durable
+branch **`workspaces/platform`** in every repo. Host `/opt/{grid,loom,nero}`
+demote to deploy-only checkouts; development happens in the workshop, through
+Loom.
+
+Deviations from cattle semantics:
+
+- **Unremovable**: `DELETE /v1/workspaces/ws-platform` is 403 with no admin
+  exception; the console shows no destroy control. Stop stays allowed for
+  host maintenance, `keep_running` is forced on, and the backing `Platform`
+  project cannot be deleted.
+- **Auto-recovery is gridd's job** (`EnsurePlatform`, on startup plus a
+  one-minute watchdog): no row -> create, mint a scoped token, bind
+  `workspaces/platform`, boot; Firecracker dead while marked running ->
+  boot; host reboot (reconcile marked it stopped with a lost-process error)
+  -> boot; operator stop -> honored. Recovery restores the last **pushed**
+  state only.
+- **Admission**: the workshop must start even when the RAM pool is full —
+  gridd parks user VMs (least recently active first, pinned ones last)
+  rather than 503ing. System runners are never touched.
+- **Guest supervision**: `nero-acp.service` keeps the interactive ACP on
+  :2419 under `Restart=always`; `nero-factory.service` (separate
+  `NERO_HOME=~/.nero-factory`) waits on `loom events --follow` plus a wake
+  file and runs one headless Nero pass per trigger; `grid-disk-gc.timer`
+  clears `~/.cache` build artifacts under disk pressure. Build output is
+  isolated per repo under `~/.cache` (cargo `target-dir`, `GOPATH`,
+  `GOCACHE`, npm cache) so checkouts stay clean.
+- **Host apply isolation** (companion fix): `grid` and `loom` deploy builds
+  write artifacts under `/var/lib/{grid,loom}` instead of in-tree, so a
+  deploy can never fill the small volume that holds `/opt`; `nero` apply
+  already used a temp worktree.
+
+Authority split stays the standard scoped-token model: the workshop token is
+`git + features + evidence + events` on the three repos. The factory Nero
+edits, pushes `workspaces/platform`, creates and submits candidates, applies
+review findings, and comments when blocked — and **never** approves, accepts,
+or deploys. Those gates, and `apply.sh`, remain owner/human-only. The
+`platform-factory` guest skill states the same contract from the agent side.
 
 ## Phases
 

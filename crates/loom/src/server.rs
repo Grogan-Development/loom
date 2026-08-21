@@ -27,8 +27,10 @@ use crate::git::{GitBridge, GitHttpGateway};
 use crate::insights::InsightsEngine; // insights-slice
 use crate::origin::{OriginCiRequest, OriginConfig, OriginEngine, OriginEvidence, OriginMirrorJob};
 use crate::review::{
-    CommentCreate, FindingApply, FindingsAppend, ReviewComplete, ReviewStart, ReviewStore,
+    CommentCreate, FindingApply, FindingsAppend, ReviewComplete, ReviewStart, ReviewStatus,
+    ReviewStore,
 };
+use crate::review_runner::{ReviewDispatcher, ReviewRunnerConfig};
 use crate::tokens::{Authority, Principal, TokenMint, TokenPerm, TokenStore};
 use crate::{AtomicRefResult, LoomError, LoomRpc, NamespaceGrant, PersistentLoomStore};
 use tokio::sync::broadcast;
@@ -50,6 +52,8 @@ pub struct ServerConfig {
     pub git_program: PathBuf,
     /// Absolute pre-receive hook executable (`loom-git-hook`).
     pub hook_program: PathBuf,
+    /// Optional dedicated Grid/Nero candidate-review backend.
+    pub review_runner: Option<ReviewRunnerConfig>,
 }
 
 #[derive(Clone)]
@@ -64,6 +68,7 @@ struct AppState {
     origin: OriginEngine,
     store: PersistentLoomStore,
     events: EventLog, // events-slice
+    review_dispatcher: Option<ReviewDispatcher>,
 }
 
 /// Combined Loom process: native RPC + features + lightning CI + Git HTTP.
@@ -96,6 +101,14 @@ impl LoomApp {
             );
         let origin = OriginEngine::new(store.clone(), config.origin);
         let events = EventLog::new(store.clone()); // events-slice
+        let review_dispatcher = config.review_runner.map(|review_runner| {
+            ReviewDispatcher::new(
+                review_runner,
+                authority.clone(),
+                reviews.clone(),
+                events.clone(),
+            )
+        });
         let state = AppState {
             token: config.token,
             deploy_token: config.deploy_token,
@@ -107,6 +120,7 @@ impl LoomApp {
             origin,
             store,
             events,
+            review_dispatcher,
         };
         let api = Router::new()
             .route("/healthz", get(healthz))
@@ -467,7 +481,11 @@ async fn list_features(State(state): State<AppState>, headers: HeaderMap) -> Res
             let visible = features
                 .into_iter()
                 .filter(|feature| {
-                    principal.allows(TokenPerm::Features, feature_repositories(feature))
+                    principal_allows_any(
+                        &principal,
+                        &[TokenPerm::Features, TokenPerm::Review],
+                        feature,
+                    )
                 })
                 .collect::<Vec<_>>();
             Json(visible).into_response()
@@ -518,7 +536,11 @@ async fn get_feature(
     };
     match state.features.get(&id) {
         Ok(feature) => {
-            if principal.allows(TokenPerm::Features, feature_repositories(&feature)) {
+            if principal_allows_any(
+                &principal,
+                &[TokenPerm::Features, TokenPerm::Review],
+                &feature,
+            ) {
                 Json(feature).into_response()
             } else {
                 forbidden()
@@ -636,6 +658,14 @@ async fn submit_candidate(
             match state.features.attach_candidate(&id, candidate) {
                 Ok(feature) => {
                     emit_feature(&state.events, "candidate.submitted", &feature);
+                    if let Some(dispatcher) = &state.review_dispatcher
+                        && let Err(error) = dispatcher.queue(&feature)
+                    {
+                        eprintln!(
+                            "loom: review dispatch preparation failed ({}): {error}",
+                            feature.id
+                        );
+                    }
                     Json(feature).into_response()
                 }
                 Err(_) => feature_error(StatusCode::CONFLICT, "feature.invalid_transition"),
@@ -785,6 +815,15 @@ fn require_feature_access(
     headers: &HeaderMap,
     id: &str,
 ) -> Result<Feature, Box<Response>> {
+    require_feature_access_for(state, headers, id, &[TokenPerm::Features])
+}
+
+fn require_feature_access_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    permissions: &[TokenPerm],
+) -> Result<Feature, Box<Response>> {
     let principal = resolve_principal(state, headers)?;
     let Ok(feature) = state.features.get(id) else {
         return Err(Box::new(feature_error(
@@ -792,10 +831,20 @@ fn require_feature_access(
             "feature.not_found",
         )));
     };
-    if !principal.allows(TokenPerm::Features, feature_repositories(&feature)) {
+    if !principal_allows_any(&principal, permissions, &feature) {
         return Err(Box::new(forbidden()));
     }
     Ok(feature)
+}
+
+fn principal_allows_any(
+    principal: &Principal,
+    permissions: &[TokenPerm],
+    feature: &Feature,
+) -> bool {
+    permissions
+        .iter()
+        .any(|permission| principal.allows(*permission, feature_repositories(feature)))
 }
 
 fn review_result<T: Serialize>(result: Result<T, LoomError>, created: bool) -> Response {
@@ -833,11 +882,28 @@ async fn create_review(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<ReviewStart>,
 ) -> Response {
-    if let Err(response) = require_feature_access(&state, &headers, &id) {
-        return *response;
-    }
+    let feature = match require_feature_access_for(
+        &state,
+        &headers,
+        &id,
+        &[TokenPerm::Features, TokenPerm::Review],
+    ) {
+        Ok(feature) => feature,
+        Err(response) => return *response,
+    };
     match state.reviews.start_or_get(&id, request) {
-        Ok((review, created)) => review_result(Ok(review), created),
+        Ok((review, created)) => {
+            if created {
+                emit_review(&state.events, "review.started", &feature, &review);
+                for finding in &review.findings {
+                    emit_review_finding(&state.events, &feature, &review, finding);
+                }
+                if review.status == ReviewStatus::Completed {
+                    emit_review(&state.events, "review.completed", &feature, &review);
+                }
+            }
+            review_result(Ok(review), created)
+        }
         Err(error) => review_result::<crate::review::Review>(Err(error), false),
     }
 }
@@ -847,7 +913,12 @@ async fn list_reviews(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Err(response) = require_feature_access(&state, &headers, &id) {
+    if let Err(response) = require_feature_access_for(
+        &state,
+        &headers,
+        &id,
+        &[TokenPerm::Features, TokenPerm::Review],
+    ) {
         return *response;
     }
     review_result(state.reviews.list_for_feature(&id), false)
@@ -859,11 +930,27 @@ async fn append_findings(
     AxumPath((id, rid)): AxumPath<(String, String)>,
     Json(request): Json<FindingsAppend>,
 ) -> Response {
-    if let Err(response) = require_feature_access(&state, &headers, &id) {
-        return *response;
-    }
+    let feature = match require_feature_access_for(
+        &state,
+        &headers,
+        &id,
+        &[TokenPerm::Features, TokenPerm::Review],
+    ) {
+        Ok(feature) => feature,
+        Err(response) => return *response,
+    };
+    let appended = request.findings.len();
     match state.reviews.append_findings(&id, &rid, request) {
-        Ok(review) => Json(review).into_response(),
+        Ok(review) => {
+            for finding in review
+                .findings
+                .iter()
+                .skip(review.findings.len().saturating_sub(appended))
+            {
+                emit_review_finding(&state.events, &feature, &review, finding);
+            }
+            Json(review).into_response()
+        }
         Err(LoomError::InvalidSourceCommit | LoomError::InvalidPath { .. }) => {
             feature_error(StatusCode::UNPROCESSABLE_ENTITY, "review.invalid")
         }
@@ -877,10 +964,28 @@ async fn complete_review(
     AxumPath((id, rid)): AxumPath<(String, String)>,
     Json(request): Json<ReviewComplete>,
 ) -> Response {
-    if let Err(response) = require_feature_access(&state, &headers, &id) {
-        return *response;
+    let feature = match require_feature_access_for(
+        &state,
+        &headers,
+        &id,
+        &[TokenPerm::Features, TokenPerm::Review],
+    ) {
+        Ok(feature) => feature,
+        Err(response) => return *response,
+    };
+    let previous = state.reviews.get(&id, &rid).ok();
+    match state.reviews.complete(&id, &rid, request) {
+        Ok(review) => {
+            let changed = previous.is_none_or(|previous| {
+                previous.status != ReviewStatus::Completed || previous.verdict != review.verdict
+            });
+            if changed {
+                emit_review(&state.events, "review.completed", &feature, &review);
+            }
+            Json(review).into_response()
+        }
+        Err(error) => review_result::<crate::review::Review>(Err(error), false),
     }
-    review_result(state.reviews.complete(&id, &rid, request), false)
 }
 
 async fn approve_finding(
@@ -911,7 +1016,12 @@ async fn list_comments(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Err(response) = require_feature_access(&state, &headers, &id) {
+    if let Err(response) = require_feature_access_for(
+        &state,
+        &headers,
+        &id,
+        &[TokenPerm::Features, TokenPerm::Review],
+    ) {
         return *response;
     }
     review_result(state.reviews.list_comments(&id), false)
@@ -923,11 +1033,44 @@ async fn create_comment(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<CommentCreate>,
 ) -> Response {
-    if let Err(response) = require_feature_access(&state, &headers, &id) {
-        return *response;
+    let feature = match require_feature_access_for(
+        &state,
+        &headers,
+        &id,
+        &[TokenPerm::Features, TokenPerm::Review],
+    ) {
+        Ok(feature) => feature,
+        Err(response) => return *response,
+    };
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    if matches!(
+        &principal,
+        Principal::Scoped(token)
+            if token.perms.contains(&TokenPerm::Review)
+                && !token.perms.contains(&TokenPerm::Features)
+                && !request.author.starts_with("agent:")
+    ) {
+        return forbidden();
     }
     match state.reviews.add_comment(&id, request) {
-        Ok(comment) => (StatusCode::CREATED, Json(comment)).into_response(),
+        Ok(comment) => {
+            emit_json(
+                &state.events,
+                "comment.added",
+                feature_repositories(&feature).map(str::to_owned),
+                serde_json::json!({
+                    "id": feature.id,
+                    "feature_id": feature.id,
+                    "comment_id": comment.id,
+                    "author": comment.author,
+                    "finding_id": comment.finding_id,
+                }),
+            );
+            (StatusCode::CREATED, Json(comment)).into_response()
+        }
         Err(LoomError::InvalidSourceCommit) => {
             feature_error(StatusCode::UNPROCESSABLE_ENTITY, "review.invalid")
         }
@@ -1052,6 +1195,45 @@ fn emit_feature(events: &EventLog, kind: &str, feature: &Feature) {
             "title": feature.title,
             "gate": feature.gate,
             "candidate_id": feature.candidate.as_ref().map(|candidate| &candidate.id),
+        }),
+    );
+}
+
+fn emit_review(events: &EventLog, kind: &str, feature: &Feature, review: &crate::review::Review) {
+    emit_json(
+        events,
+        kind,
+        feature_repositories(feature).map(str::to_owned),
+        serde_json::json!({
+            "id": feature.id,
+            "feature_id": feature.id,
+            "review_id": review.id,
+            "candidate_id": review.candidate_id,
+            "status": review.status,
+            "verdict": review.verdict,
+        }),
+    );
+}
+
+fn emit_review_finding(
+    events: &EventLog,
+    feature: &Feature,
+    review: &crate::review::Review,
+    finding: &crate::review::Finding,
+) {
+    emit_json(
+        events,
+        "review.finding",
+        feature_repositories(feature).map(str::to_owned),
+        serde_json::json!({
+            "id": feature.id,
+            "feature_id": feature.id,
+            "review_id": review.id,
+            "candidate_id": review.candidate_id,
+            "finding_id": finding.id,
+            "severity": finding.severity,
+            "repo": finding.repo,
+            "path": finding.path,
         }),
     );
 }

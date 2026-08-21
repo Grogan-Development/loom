@@ -28,7 +28,7 @@ Origin webhook (Origin App signatures, not a bearer token):
 
 Owner bearer (`Authorization: Bearer $LOOM_TOKEN`) — features, CAS RPC, Git, `POST /v1/releases/{repo}/ci`, and evidence GET. `{repo}` is `loom`, `nero`, or `grid` (not `grogan-dev/…`). `{oid}` is a lowercase hex SHA (7–64 chars).
 
-Scoped tokens (owner-minted, for Grid workspaces / runners / agents; see [docs/platform.md](docs/platform.md)): `POST /v1/tokens` with `{ name, repositories, perms, expires_at? }` returns an `lt_…` secret once. Perms: `git` (gateway, Bearer or Basic password), `features` (create/read/candidates on bound repos; gates stay owner-only), `evidence` (release GET), `events` (reserved). `GET /v1/tokens` lists, `DELETE /v1/tokens/{id}` revokes immediately.
+Scoped tokens (owner-minted, for Grid workspaces / runners / agents; see [docs/platform.md](docs/platform.md)): `POST /v1/tokens` with `{ name, repositories, perms, expires_at? }` returns an `lt_…` secret once. Perms: `git` (gateway, Bearer or Basic password), `features` (create/read/candidates and approved-patch apply on bound repos; gates stay owner-only), `evidence` (release/insights reads), `review` (feature read plus findings, verdicts, and agent comments, but no candidate/apply/promotion authority), and `events`. `GET /v1/tokens` lists, `DELETE /v1/tokens/{id}` revokes immediately.
 
 | Method | Path | Role |
 | --- | --- | --- |
@@ -79,6 +79,21 @@ commands = [
 ```
 
 If that file is absent: `Cargo.toml` → `cargo test --offline`, `package.json` → `npm test`, otherwise a non-empty tree check.
+
+### Grid review Nero
+
+Automatic candidate review is opt-in and fails closed at startup when its contract is incomplete. Configure the Loom service with:
+
+```bash
+LOOM_REVIEW_BACKEND=grid
+LOOM_PUBLIC_URL=https://loom.grogan.dev
+LOOM_GRID_URL=https://grogan.dev
+LOOM_GRID_INTERNAL_TOKEN=replace-with-grid-internal-token
+LOOM_REVIEW_COMMAND_JSON='["nero","--permission-mode","default","--disable-web-search","--no-subagents","--single","Use the loom-review skill to review the candidate identified by FEATURE_ID. Post findings and a verdict, but never apply or accept changes."]'
+LOOM_REVIEW_TIMEOUT_SECS=900
+```
+
+Loom creates the durable review before returning the candidate response, then dispatches Grid asynchronously. The VM receives exact immutable revisions and a short-lived token carrying only `review` + `evidence`; Loom revokes it when the job finishes. A runner that exits without posting a verdict is durably completed with a non-approving `comment` verdict and a system comment, so blocking review policy remains closed.
 
 ## Docker (bare metal)
 

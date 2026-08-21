@@ -106,6 +106,7 @@ fn test_app(root: PathBuf) -> axum::Router {
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/bin/true"),
+        review_runner: None,
     })
     .unwrap();
     app.router()

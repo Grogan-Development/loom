@@ -13,8 +13,10 @@ use http_body_util::BodyExt as _;
 use loom::auth::AccessToken;
 use loom::ci::CiEngine;
 use loom::contracts::{ArtifactDigest, RepositoryBinding};
+use loom::events::EventLog;
 use loom::features::{EvidencePolicy, FeatureCreate, FeatureStore, Scenario};
 use loom::origin::OriginConfig;
+use loom::review::{ReviewComplete, ReviewStart, ReviewStore, ReviewVerdict};
 use loom::server::{LoomApp, ServerConfig};
 use loom::{NamespaceGrant, PersistentLoomStore};
 use sha2::{Digest as _, Sha256};
@@ -54,6 +56,7 @@ fn test_app() -> (tempfile::TempDir, PathBuf, axum::Router) {
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/bin/true"),
+        review_runner: None,
     })
     .unwrap();
     (directory, root, app.router())
@@ -141,6 +144,30 @@ fn upsert_patch(path: &str, contents: &[u8]) -> serde_json::Value {
         "digest": { "algorithm": digest.algorithm, "value": digest.value },
         "contents_base64": Base64::encode_string(contents),
     })
+}
+
+#[test]
+fn blocking_review_requires_an_explicit_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("loom");
+    let (store, _grant, feature_id) = seed_feature(&root);
+    let reviews = ReviewStore::new(store);
+    assert!(!reviews.blocking_ok(&feature_id));
+    let (review, created) = reviews
+        .start_or_get(&feature_id, ReviewStart::default())
+        .unwrap();
+    assert!(created);
+    assert!(!reviews.blocking_ok(&feature_id));
+    reviews
+        .complete(
+            &feature_id,
+            &review.id,
+            ReviewComplete {
+                verdict: ReviewVerdict::Approve,
+            },
+        )
+        .unwrap();
+    assert!(reviews.blocking_ok(&feature_id));
 }
 
 #[tokio::test]
@@ -488,4 +515,149 @@ async fn scoped_token_for_other_repo_cannot_post_findings() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"].as_str().unwrap(), "loom.forbidden");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn review_token_records_lifecycle_but_cannot_apply_or_author_as_human() {
+    let (_directory, root, router) = test_app();
+    let (store, _grant, feature_id) = seed_feature(&root);
+
+    let (status, minted) = send(
+        &router,
+        json_request(
+            "POST",
+            "/v1/tokens",
+            OWNER,
+            serde_json::json!({
+                "name": "review-job",
+                "repositories": ["demo"],
+                "perms": ["review", "evidence"],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let secret = minted["secret"].as_str().unwrap();
+    assert_eq!(
+        minted["token"]["perms"],
+        serde_json::json!(["evidence", "review"])
+    );
+
+    let (status, _) = send(
+        &router,
+        json_request(
+            "GET",
+            &format!("/v1/features/{feature_id}"),
+            secret,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, review) = send(
+        &router,
+        json_request(
+            "POST",
+            &format!("/v1/features/{feature_id}/reviews"),
+            secret,
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let review_id = review["id"].as_str().unwrap();
+
+    let (status, review) = send(
+        &router,
+        json_request(
+            "POST",
+            &format!("/v1/features/{feature_id}/reviews/{review_id}/findings"),
+            secret,
+            serde_json::json!({
+                "findings": [{
+                    "severity": "warning",
+                    "repo": "demo",
+                    "path": "README.md",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "message": "candidate needs a clearer heading",
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let finding_id = review["findings"][0]["id"].as_str().unwrap();
+
+    for (path, body) in [
+        (
+            format!("/v1/features/{feature_id}/findings/{finding_id}/approve"),
+            serde_json::json!({}),
+        ),
+        (
+            format!("/v1/features/{feature_id}/findings/{finding_id}/apply"),
+            serde_json::json!({}),
+        ),
+        (
+            format!("/v1/features/{feature_id}/candidates"),
+            serde_json::json!({"repositories": []}),
+        ),
+    ] {
+        let (status, _) = send(&router, json_request("POST", &path, secret, body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "path {path}");
+    }
+
+    let (status, _) = send(
+        &router,
+        json_request(
+            "POST",
+            &format!("/v1/features/{feature_id}/comments"),
+            secret,
+            serde_json::json!({"author": "human", "body": "impersonation"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &router,
+        json_request(
+            "POST",
+            &format!("/v1/features/{feature_id}/comments"),
+            secret,
+            serde_json::json!({"author": "agent:review", "body": "finding posted"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, completed) = send(
+        &router,
+        json_request(
+            "POST",
+            &format!("/v1/features/{feature_id}/reviews/{review_id}/complete"),
+            secret,
+            serde_json::json!({"verdict": "request_changes"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(completed["status"], "completed");
+
+    let kinds = EventLog::new(store)
+        .since(None, 20)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            "review.started",
+            "review.finding",
+            "comment.added",
+            "review.completed",
+        ]
+    );
 }
