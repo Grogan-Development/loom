@@ -9,7 +9,7 @@
 //! `feature.accepted`, `feature.rejected`, `candidate.submitted`,
 //! `ci.started`, `ci.finished`, `insights.ready`, `review.started`,
 //! `review.finding`, `review.completed`, `comment.added`, `refs.moved`,
-//! `deploy.applied`.
+//! `refs.bootstrapped`, `deploy.applied`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;

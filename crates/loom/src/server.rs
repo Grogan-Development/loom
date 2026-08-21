@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{AccessToken, bearer_token};
 use crate::catalog::{RepoCatalog, RepoUpsert};
 use crate::ci::CiEngine;
+use crate::contracts::RepositoryRevision;
 use crate::events::{DEFAULT_CATCH_UP, Event, EventLog, MAX_CATCH_UP};
 use crate::features::{CandidateSubmit, Feature, FeatureCreate, FeatureStore, promotion_updates};
 use crate::git::{GitBridge, GitHttpGateway};
@@ -68,6 +69,7 @@ struct AppState {
     insights: InsightsEngine, // insights-slice
     origin: OriginEngine,
     catalog: RepoCatalog,
+    git_bridge: Option<GitBridge>,
     store: PersistentLoomStore,
     events: EventLog, // events-slice
     review_dispatcher: Option<ReviewDispatcher>,
@@ -99,11 +101,11 @@ impl LoomApp {
         let origin = OriginEngine::new(store.clone(), config.origin);
         let catalog = origin.catalog().clone();
         catalog.ensure_seeded()?;
-        let git_router = GitBridge::new(store.clone(), &config.git_program, &config.hook_program)
-            .map_or_else(
-                |_| Router::new(),
-                |bridge| GitHttpGateway::new(bridge, authority.clone(), catalog.clone()).router(),
-            );
+        let git_bridge =
+            GitBridge::new(store.clone(), &config.git_program, &config.hook_program).ok();
+        let git_router = git_bridge.clone().map_or_else(Router::new, |bridge| {
+            GitHttpGateway::new(bridge, authority.clone(), catalog.clone()).router()
+        });
         let events = EventLog::new(store.clone()); // events-slice
         let review_dispatcher = config.review_runner.map(|review_runner| {
             ReviewDispatcher::new(
@@ -127,6 +129,7 @@ impl LoomApp {
             insights,
             origin,
             catalog,
+            git_bridge,
             store,
             events,
             review_dispatcher,
@@ -137,6 +140,7 @@ impl LoomApp {
             .route("/v1/tokens/{id}", delete(revoke_token))
             .route("/v1/repos", get(list_repos).post(upsert_repo))
             .route("/v1/repos/{name}", get(get_repo).delete(delete_repo))
+            .route("/loom/v1/refs/bootstrap", post(bootstrap_ref))
             .route("/v1/events", get(list_events)) // events-slice
             .route("/v1/features", get(list_features).post(create_feature))
             .route("/v1/features/{id}", get(get_feature))
@@ -585,6 +589,149 @@ fn require_registered<'a>(
         }
     }
     Ok(())
+}
+
+/// Request body for the owner-only `POST /loom/v1/refs/bootstrap`.
+///
+/// Exactly one of `revision` (native snapshot) or `git_oid` (Git-imported
+/// commit resolved through the durable oid↔revision mapping) is required.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapRequest {
+    #[serde(alias = "repository")]
+    repo: String,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    git_oid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BootstrapResponse {
+    repo: String,
+    ref_name: String,
+    revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_oid: Option<String>,
+    created: bool,
+    read_back: bool,
+}
+
+/// Owner-only, idempotent creation of the initial protected ref from an
+/// already-imported revision. Never moves an existing ref: a protected ref
+/// at a different revision is a 409.
+async fn bootstrap_ref(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BootstrapRequest>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let entry = match state.catalog.get(&request.repo) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return feature_error(StatusCode::NOT_FOUND, "repo.unknown"),
+        Err(_) => {
+            return feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable");
+        }
+    };
+    let revision = match bootstrap_revision(&state, &request) {
+        Ok(revision) => revision,
+        Err(response) => return *response,
+    };
+    let grant = NamespaceGrant::new(BTreeSet::from([request.repo.clone()]));
+    let created =
+        match state
+            .store
+            .create_ref(&grant, &request.repo, &entry.protected_ref, &revision)
+        {
+            Ok(()) => true,
+            Err(LoomError::RefConflict { .. }) => false,
+            Err(LoomError::UnknownRevision { .. }) => {
+                return feature_error(StatusCode::NOT_FOUND, "revision.unknown");
+            }
+            Err(LoomError::InvalidRef { .. } | LoomError::InvalidRepository { .. }) => {
+                return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "bootstrap.invalid");
+            }
+            Err(_) => {
+                return feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable");
+            }
+        };
+    // Exact read-back: the protected ref must resolve to the requested
+    // revision whether it was just created or already existed. Anything else
+    // is a conflict the owner has to resolve explicitly.
+    match state
+        .store
+        .resolve_ref(&grant, &request.repo, &entry.protected_ref)
+    {
+        Ok(current) if current == revision => {}
+        Ok(_) => return feature_error(StatusCode::CONFLICT, "loom.ref_conflict"),
+        Err(_) => {
+            return feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable");
+        }
+    }
+    if created {
+        emit_json(
+            &state.events,
+            "refs.bootstrapped",
+            [request.repo.clone()],
+            serde_json::json!({
+                "repo": request.repo,
+                "ref_name": entry.protected_ref,
+                "revision": revision.revision,
+                "git_oid": request.git_oid,
+                "source": if request.git_oid.is_some() { "git" } else { "revision" },
+            }),
+        );
+    }
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(BootstrapResponse {
+            repo: request.repo,
+            ref_name: entry.protected_ref,
+            revision: revision.revision,
+            git_oid: request.git_oid,
+            created,
+            read_back: true,
+        }),
+    )
+        .into_response()
+}
+
+/// Resolves the requested bootstrap source to a revision Loom already holds.
+fn bootstrap_revision(
+    state: &AppState,
+    request: &BootstrapRequest,
+) -> Result<RepositoryRevision, Box<Response>> {
+    match (&request.revision, &request.git_oid) {
+        (Some(revision), None) => RepositoryRevision::new(&request.repo, revision).map_err(|_| {
+            Box::new(feature_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "bootstrap.invalid",
+            ))
+        }),
+        (None, Some(git_oid)) => {
+            let Some(bridge) = &state.git_bridge else {
+                return Err(Box::new(feature_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "loom.git_unavailable",
+                )));
+            };
+            let grant = NamespaceGrant::new(BTreeSet::from([request.repo.clone()]));
+            bridge
+                .revision_for_git_oid(&grant, &request.repo, git_oid)
+                .map_err(|_| Box::new(feature_error(StatusCode::NOT_FOUND, "revision.unknown")))
+        }
+        _ => Err(Box::new(feature_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bootstrap.invalid",
+        ))),
+    }
 }
 
 async fn list_features(State(state): State<AppState>, headers: HeaderMap) -> Response {
