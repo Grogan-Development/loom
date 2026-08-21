@@ -54,6 +54,12 @@ pub struct ScopedToken {
     pub repositories: BTreeSet<String>,
     /// Capabilities granted on those repositories.
     pub perms: BTreeSet<TokenPerm>,
+    /// Optional feature binding for an automated review job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_id: Option<String>,
+    /// Optional review binding for an automated review job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
     /// Unix seconds after which the token stops resolving, if bounded.
     pub expires_at: Option<u64>,
     /// Unix seconds at mint time.
@@ -78,6 +84,12 @@ pub struct TokenMint {
     pub repositories: Vec<String>,
     /// Capabilities granted on those repositories.
     pub perms: Vec<TokenPerm>,
+    /// Bind a review token to one feature. Must be paired with `review_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_id: Option<String>,
+    /// Bind a review token to one review. Must be paired with `feature_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
     /// Optional unix-seconds expiry.
     #[serde(default)]
     pub expires_at: Option<u64>,
@@ -257,6 +269,60 @@ impl Principal {
         }
     }
 
+    /// True when this principal may use `perm` for this exact feature.
+    ///
+    /// Unbound workspace tokens retain repository-scoped behavior. Automated
+    /// review tokens carry a feature/review binding and cannot use their
+    /// short-lived capability against another feature in the same repository.
+    pub fn allows_feature<'a>(
+        &self,
+        perm: TokenPerm,
+        repositories: impl IntoIterator<Item = &'a str>,
+        feature_id: &str,
+    ) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Scoped(token) => {
+                token
+                    .feature_id
+                    .as_deref()
+                    .is_none_or(|bound| bound == feature_id)
+                    && token.perms.contains(&perm)
+                    && repositories
+                        .into_iter()
+                        .all(|repository| token.repositories.contains(repository))
+            }
+        }
+    }
+
+    /// True when this principal may mutate this exact review.
+    pub fn allows_review<'a>(
+        &self,
+        repositories: impl IntoIterator<Item = &'a str>,
+        feature_id: &str,
+        review_id: &str,
+    ) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Scoped(token) => {
+                self.allows_feature(TokenPerm::Review, repositories, feature_id)
+                    && token
+                        .review_id
+                        .as_deref()
+                        .is_none_or(|bound| bound == review_id)
+            }
+        }
+    }
+
+    /// Exact automated-review binding, when present.
+    #[must_use]
+    pub fn review_binding(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Scoped(token) => token.feature_id.as_deref().zip(token.review_id.as_deref()),
+            Self::Owner => None,
+        }
+    }
+
     /// True for the owner principal.
     #[must_use]
     pub const fn is_owner(&self) -> bool {
@@ -313,6 +379,14 @@ fn validate_mint(request: &TokenMint) -> Result<ScopedToken, LoomError> {
     if request.perms.is_empty() {
         return Err(LoomError::InvalidToken);
     }
+    match (&request.feature_id, &request.review_id) {
+        (None, None) => {}
+        (Some(feature_id), Some(review_id))
+            if request.perms.contains(&TokenPerm::Review)
+                && valid_binding_id(feature_id)
+                && valid_binding_id(review_id) => {}
+        _ => return Err(LoomError::InvalidToken),
+    }
     let created_at = unix_now();
     if let Some(expires_at) = request.expires_at
         && expires_at <= created_at
@@ -325,9 +399,19 @@ fn validate_mint(request: &TokenMint) -> Result<ScopedToken, LoomError> {
         secret_sha256: String::new(),
         repositories,
         perms: request.perms.iter().copied().collect(),
+        feature_id: request.feature_id.clone(),
+        review_id: request.review_id.clone(),
         expires_at: request.expires_at,
         created_at,
     })
+}
+
+fn valid_binding_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

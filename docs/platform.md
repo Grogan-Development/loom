@@ -252,10 +252,14 @@ Unlike default Nero, review Nero never lands changes directly:
   mutations as a new commit on the candidate branch and re-triggers the
   pipeline (CI + insights re-run; caches make unchanged repos cheap).
 - Its short-lived runner token is scoped to `review` + `evidence` on the bound
-  repos only — it cannot submit candidates, approve/apply findings, push,
-  accept, or touch protected refs. Grid additionally removes workspace sudo,
-  makes materialized source read-only, and rejects non-headless or
-  permission-bypassing review commands.
+  repos and bound to the exact feature/review — it cannot review a sibling
+  feature, submit candidates, approve/apply findings, push, accept, or touch
+  protected refs. Grid additionally removes workspace sudo, root-owns and
+  write-locks materialized source, rejects escaping source symlinks, and
+  rejects non-headless, network-search-enabled, subagent-enabled, or
+  permission-bypassing review commands. Automatic in-progress reviews retain
+  a deterministic Grid job id so Loom can resume monitoring or redispatch
+  safely after restart.
 
 ## 7. Events: Loom is the pulse
 

@@ -661,3 +661,101 @@ async fn review_token_records_lifecycle_but_cannot_apply_or_author_as_human() {
         ]
     );
 }
+
+#[tokio::test]
+async fn automated_review_token_is_bound_to_one_feature_and_review() {
+    let (_directory, root, router) = test_app();
+    let (store, _grant, feature_id) = seed_feature(&root);
+
+    let (status, review) = send(
+        &router,
+        json_request(
+            "POST",
+            &format!("/v1/features/{feature_id}/reviews"),
+            OWNER,
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let review_id = review["id"].as_str().unwrap();
+
+    let original = FeatureStore::new(store.clone()).get(&feature_id).unwrap();
+    let other = FeatureStore::new(store)
+        .create(FeatureCreate {
+            title: "other candidate in same repo".to_owned(),
+            repositories: original.repositories,
+            scenarios: vec![Scenario {
+                name: "other".to_owned(),
+                given: "the same repository".to_owned(),
+                when: "a bound reviewer authenticates".to_owned(),
+                then: "the other feature remains inaccessible".to_owned(),
+            }],
+            evidence_policy: EvidencePolicy::minimum(),
+        })
+        .unwrap();
+
+    let (status, minted) = send(
+        &router,
+        json_request(
+            "POST",
+            "/v1/tokens",
+            OWNER,
+            serde_json::json!({
+                "name": "bound-review-job",
+                "repositories": ["demo"],
+                "perms": ["review", "evidence"],
+                "feature_id": feature_id,
+                "review_id": review_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(minted["token"]["feature_id"], feature_id);
+    assert_eq!(minted["token"]["review_id"], review_id);
+    let secret = minted["secret"].as_str().unwrap();
+
+    let (status, resumed) = send(
+        &router,
+        json_request(
+            "POST",
+            &format!("/v1/features/{feature_id}/reviews"),
+            secret,
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resumed["id"], review_id);
+
+    let (status, _) = send(
+        &router,
+        json_request(
+            "GET",
+            &format!("/v1/features/{}", other.id),
+            secret,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    for suffix in ["findings", "complete"] {
+        let (status, _) = send(
+            &router,
+            json_request(
+                "POST",
+                &format!("/v1/features/{feature_id}/reviews/not-the-bound-review/{suffix}"),
+                secret,
+                if suffix == "complete" {
+                    serde_json::json!({"verdict": "approve"})
+                } else {
+                    serde_json::json!({"findings": []})
+                },
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "suffix {suffix}");
+    }
+}

@@ -28,7 +28,7 @@ Origin webhook (Origin App signatures, not a bearer token):
 
 Owner bearer (`Authorization: Bearer $LOOM_TOKEN`) — features, CAS RPC, Git, `POST /v1/releases/{repo}/ci`, and evidence GET. `{repo}` is `loom`, `nero`, or `grid` (not `grogan-dev/…`). `{oid}` is a lowercase hex SHA (7–64 chars).
 
-Scoped tokens (owner-minted, for Grid workspaces / runners / agents; see [docs/platform.md](docs/platform.md)): `POST /v1/tokens` with `{ name, repositories, perms, expires_at? }` returns an `lt_…` secret once. Perms: `git` (gateway, Bearer or Basic password), `features` (create/read/candidates and approved-patch apply on bound repos; gates stay owner-only), `evidence` (release/insights reads), `review` (feature read plus findings, verdicts, and agent comments, but no candidate/apply/promotion authority), and `events`. `GET /v1/tokens` lists, `DELETE /v1/tokens/{id}` revokes immediately.
+Scoped tokens (owner-minted, for Grid workspaces / runners / agents; see [docs/platform.md](docs/platform.md)): `POST /v1/tokens` with `{ name, repositories, perms, expires_at?, feature_id?, review_id? }` returns an `lt_…` secret once. `feature_id` and `review_id` must appear together and require `review`; automatic jobs use them to prevent cross-feature/review access within the same repo. Perms: `git` (gateway, Bearer or Basic password), `features` (create/read/candidates and approved-patch apply on bound repos; gates stay owner-only), `evidence` (release/insights reads), `review` (feature read plus findings, verdicts, and agent comments, but no candidate/apply/promotion authority), and `events`. `GET /v1/tokens` lists, `DELETE /v1/tokens/{id}` revokes immediately.
 
 | Method | Path | Role |
 | --- | --- | --- |
@@ -93,7 +93,7 @@ LOOM_REVIEW_COMMAND_JSON='["nero","--permission-mode","default","--disable-web-s
 LOOM_REVIEW_TIMEOUT_SECS=900
 ```
 
-Loom creates the durable review before returning the candidate response, then dispatches Grid asynchronously. The VM receives exact immutable revisions and a short-lived token carrying only `review` + `evidence`; Loom revokes it when the job finishes. A runner that exits without posting a verdict is durably completed with a non-approving `comment` verdict and a system comment, so blocking review policy remains closed.
+Loom creates the durable review before returning the candidate response, then dispatches Grid asynchronously. The VM receives exact immutable revisions and a short-lived token carrying only `review` + `evidence`, bound to that exact feature and review; Loom revokes it when the job finishes. In-progress automatic reviews are recovered after a Loom restart by their deterministic Grid job id. A runner that exits without posting a verdict is durably completed with a non-approving `comment` verdict and a system comment, so blocking review policy remains closed.
 
 ## Docker (bare metal)
 

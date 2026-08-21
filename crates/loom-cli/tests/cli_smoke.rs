@@ -1,23 +1,45 @@
 //! Smoke the user-facing `loom` command against a live Loom router.
 #![allow(clippy::unwrap_used, missing_docs)]
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use loom::auth::AccessToken;
 use loom::origin::OriginConfig;
 use loom::server::{LoomApp, ServerConfig};
+use loom::{NamespaceGrant, PersistentLoomStore};
 
 const OWNER: &str = "owner-token";
-const REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-fn test_app() -> (tempfile::TempDir, axum::Router) {
+fn test_app() -> (tempfile::TempDir, axum::Router, String, String) {
     let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("loom");
+    let store = PersistentLoomStore::open(&root).unwrap();
+    let grant = NamespaceGrant::new(BTreeSet::from(["demo".to_owned()]));
+    let base = store
+        .commit(
+            &grant,
+            "demo",
+            None,
+            BTreeMap::from([("README.md".to_owned(), b"base\n".to_vec())]),
+        )
+        .unwrap();
+    let head = store
+        .commit(
+            &grant,
+            "demo",
+            Some(&base),
+            BTreeMap::from([("README.md".to_owned(), b"candidate\n".to_vec())]),
+        )
+        .unwrap();
+    store
+        .create_ref(&grant, "demo", "refs/main", &base)
+        .unwrap();
     let origin = OriginConfig::for_test(directory.path().join("origin-work"), true);
     let app = LoomApp::new(ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
-        root: directory.path().join("loom"),
+        root,
         token: AccessToken::new(OWNER),
         deploy_token: None,
         origin,
@@ -26,11 +48,34 @@ fn test_app() -> (tempfile::TempDir, axum::Router) {
         review_runner: None,
     })
     .unwrap();
-    (directory, app.router())
+    (directory, app.router(), base.revision, head.revision)
 }
 
 fn loom_cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_loom-cli"))
+}
+
+fn write_json(directory: &tempfile::TempDir, name: &str, value: &serde_json::Value) -> PathBuf {
+    let path = directory.path().join(name);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    path
+}
+
+async fn submit_candidate(url: &str, feature: &str, file: &Path) -> String {
+    let (ok, text) = run_cli(
+        url,
+        &[
+            "candidate",
+            "submit",
+            "--feature",
+            feature,
+            "--file",
+            file.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(ok, "candidate submit should succeed: {text}");
+    text
 }
 
 fn run_help(args: &[&str]) -> (bool, String) {
@@ -104,7 +149,7 @@ fn documented_command_shapes_parse_and_use_the_stable_name() {
 
 #[tokio::test]
 async fn documented_reads_comments_and_review_apply_hit_real_routes() {
-    let (directory, router) = test_app();
+    let (directory, router, base_revision, head_revision) = test_app();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -113,23 +158,21 @@ async fn documented_reads_comments_and_review_apply_hit_real_routes() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let url = format!("http://{addr}");
 
-    let feature_file = directory.path().join("feature.json");
-    std::fs::write(
-        &feature_file,
-        serde_json::to_vec(&serde_json::json!({
+    let feature_file = write_json(
+        &directory,
+        "feature.json",
+        &serde_json::json!({
             "title": "cli smoke",
             "repositories": [{
-                "base": { "repository": "demo", "revision": REVISION },
+                "base": { "repository": "demo", "revision": base_revision },
                 "head": null,
                 "target_ref": "refs/main",
             }],
             "scenarios": [{
                 "name": "s", "given": "g", "when": "w", "then": "t",
             }],
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+        }),
+    );
     let (ok, text) = run_cli(
         &url,
         &[
@@ -144,10 +187,30 @@ async fn documented_reads_comments_and_review_apply_hit_real_routes() {
     let feature: serde_json::Value = serde_json::from_str(&text).unwrap();
     let feature_id = feature["id"].as_str().unwrap();
 
+    let candidate_file = write_json(
+        &directory,
+        "candidate.json",
+        &serde_json::json!({
+            "repositories": [{
+                "base": { "repository": "demo", "revision": base_revision },
+                "head": { "repository": "demo", "revision": head_revision },
+                "target_ref": "refs/main",
+            }]
+        }),
+    );
+
+    let (ok, text) = run_cli(&url, &["feature", "approve", feature_id]).await;
+    assert!(ok, "feature approve should succeed: {text}");
+    let text = submit_candidate(&url, feature_id, &candidate_file).await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["candidate"]["repositories"][0]["head"]
+            ["revision"],
+        head_revision
+    );
+
     for args in [
         vec!["feature", "list"],
         vec!["feature", "show", feature_id],
-        vec!["feature", "approve", feature_id],
         vec!["evidence", "--feature", feature_id],
         vec!["insights", "--feature", feature_id],
         vec!["review", "list", "--feature", feature_id],

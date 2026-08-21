@@ -105,10 +105,14 @@ impl LoomApp {
             ReviewDispatcher::new(
                 review_runner,
                 authority.clone(),
+                features.clone(),
                 reviews.clone(),
                 events.clone(),
             )
         });
+        if let Some(dispatcher) = &review_dispatcher {
+            dispatcher.recover()?;
+        }
         let state = AppState {
             token: config.token,
             deploy_token: config.deploy_token,
@@ -687,7 +691,11 @@ async fn get_insights(
     let Ok(feature) = state.features.get(&id) else {
         return feature_error(StatusCode::NOT_FOUND, "feature.not_found");
     };
-    if !principal.allows(TokenPerm::Evidence, feature_repositories(&feature)) {
+    if !principal.allows_feature(
+        TokenPerm::Evidence,
+        feature_repositories(&feature),
+        &feature.id,
+    ) {
         return forbidden();
     }
     match state.insights.bundle_for_feature(&feature) {
@@ -842,9 +850,9 @@ fn principal_allows_any(
     permissions: &[TokenPerm],
     feature: &Feature,
 ) -> bool {
-    permissions
-        .iter()
-        .any(|permission| principal.allows(*permission, feature_repositories(feature)))
+    permissions.iter().any(|permission| {
+        principal.allows_feature(*permission, feature_repositories(feature), &feature.id)
+    })
 }
 
 fn review_result<T: Serialize>(result: Result<T, LoomError>, created: bool) -> Response {
@@ -882,6 +890,10 @@ async fn create_review(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<ReviewStart>,
 ) -> Response {
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     let feature = match require_feature_access_for(
         &state,
         &headers,
@@ -891,6 +903,12 @@ async fn create_review(
         Ok(feature) => feature,
         Err(response) => return *response,
     };
+    if let Some((bound_feature, bound_review)) = principal.review_binding() {
+        if bound_feature != id {
+            return forbidden();
+        }
+        return review_result(state.reviews.get(&id, bound_review), false);
+    }
     match state.reviews.start_or_get(&id, request) {
         Ok((review, created)) => {
             if created {
@@ -930,6 +948,10 @@ async fn append_findings(
     AxumPath((id, rid)): AxumPath<(String, String)>,
     Json(request): Json<FindingsAppend>,
 ) -> Response {
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     let feature = match require_feature_access_for(
         &state,
         &headers,
@@ -939,6 +961,9 @@ async fn append_findings(
         Ok(feature) => feature,
         Err(response) => return *response,
     };
+    if !principal.allows_review(feature_repositories(&feature), &id, &rid) {
+        return forbidden();
+    }
     let appended = request.findings.len();
     match state.reviews.append_findings(&id, &rid, request) {
         Ok(review) => {
@@ -964,6 +989,10 @@ async fn complete_review(
     AxumPath((id, rid)): AxumPath<(String, String)>,
     Json(request): Json<ReviewComplete>,
 ) -> Response {
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     let feature = match require_feature_access_for(
         &state,
         &headers,
@@ -973,6 +1002,9 @@ async fn complete_review(
         Ok(feature) => feature,
         Err(response) => return *response,
     };
+    if !principal.allows_review(feature_repositories(&feature), &id, &rid) {
+        return forbidden();
+    }
     let previous = state.reviews.get(&id, &rid).ok();
     match state.reviews.complete(&id, &rid, request) {
         Ok(review) => {

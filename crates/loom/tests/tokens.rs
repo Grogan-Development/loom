@@ -148,6 +148,23 @@ async fn token_mint_requires_owner_and_validates() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, _) = send(
+        &router,
+        json_request(
+            "POST",
+            "/v1/tokens",
+            OWNER,
+            serde_json::json!({
+                "name": "bad-bound-review",
+                "repositories": ["demo"],
+                "perms": ["review"],
+                "feature_id": "feature-without-review",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]

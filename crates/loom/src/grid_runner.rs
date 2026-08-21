@@ -174,6 +174,20 @@ impl GridRunner {
         serde_json::from_slice(&bytes).map_err(|_| GridRunnerError::InvalidResponse)
     }
 
+    /// Cancels a queued or running Grid job.
+    ///
+    /// # Errors
+    ///
+    /// Returns when Grid cannot durably record cancellation.
+    pub fn cancel(&self, id: &str) -> Result<(), GridRunnerError> {
+        let path = format!("/internal/runners/{id}/cancel");
+        let (status, _) = self.request("POST", &path, None)?;
+        if status != 200 {
+            return Err(GridRunnerError::Status(status));
+        }
+        Ok(())
+    }
+
     /// Polls until the job is terminal or `timeout` elapses.
     ///
     /// # Errors

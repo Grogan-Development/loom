@@ -57,6 +57,9 @@ pub struct Review {
     pub status: ReviewStatus,
     /// Recorded verdict, if any.
     pub verdict: Option<ReviewVerdict>,
+    /// Deterministic Grid job id for an automatically dispatched review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_job_id: Option<String>,
     /// Findings posted against this candidate.
     pub findings: Vec<Finding>,
 }
@@ -224,6 +227,32 @@ impl ReviewStore {
         feature_id: &str,
         request: ReviewStart,
     ) -> Result<(Review, bool), LoomError> {
+        self.start_or_get_inner(feature_id, request, false)
+    }
+
+    /// Starts an automatically dispatched review and records its deterministic
+    /// Grid job identity for restart recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns under the same conditions as [`Self::start_or_get`].
+    pub fn start_runner_review(&self, feature_id: &str) -> Result<(Review, bool), LoomError> {
+        self.start_or_get_inner(
+            feature_id,
+            ReviewStart {
+                status: Some(ReviewStatus::InProgress),
+                ..ReviewStart::default()
+            },
+            true,
+        )
+    }
+
+    fn start_or_get_inner(
+        &self,
+        feature_id: &str,
+        request: ReviewStart,
+        runner: bool,
+    ) -> Result<(Review, bool), LoomError> {
         let feature = FeatureStore::new(self.store.clone()).get(feature_id)?;
         let candidate_id = feature
             .candidate
@@ -248,8 +277,10 @@ impl ReviewStore {
         } else {
             ReviewStatus::InProgress
         });
+        let id = Uuid::now_v7().to_string();
         let review = Review {
-            id: Uuid::now_v7().to_string(),
+            runner_job_id: runner.then(|| format!("rev-{id}")),
+            id,
             feature_id: feature_id.to_owned(),
             candidate_id,
             status,

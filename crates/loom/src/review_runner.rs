@@ -8,10 +8,10 @@ use thiserror::Error;
 
 use crate::LoomError;
 use crate::events::EventLog;
-use crate::features::Feature;
+use crate::features::{Feature, FeatureStore};
 use crate::grid_runner::{CreateRunnerRequest, GridRepo, GridRunner, GridRunnerError};
 use crate::review::{
-    CommentCreate, Review, ReviewComplete, ReviewStart, ReviewStatus, ReviewStore, ReviewVerdict,
+    CommentCreate, Review, ReviewComplete, ReviewStatus, ReviewStore, ReviewVerdict,
 };
 use crate::tokens::{Authority, TokenMint, TokenPerm};
 
@@ -101,6 +101,7 @@ impl ReviewRunnerConfig {
 pub struct ReviewDispatcher {
     config: ReviewRunnerConfig,
     authority: Authority,
+    features: FeatureStore,
     reviews: ReviewStore,
     events: EventLog,
 }
@@ -111,12 +112,14 @@ impl ReviewDispatcher {
     pub const fn new(
         config: ReviewRunnerConfig,
         authority: Authority,
+        features: FeatureStore,
         reviews: ReviewStore,
         events: EventLog,
     ) -> Self {
         Self {
             config,
             authority,
+            features,
             reviews,
             events,
         }
@@ -144,17 +147,50 @@ impl ReviewDispatcher {
         {
             return Err(LoomError::InvalidSourceCommit);
         }
-        let (review, created) = self.reviews.start_or_get(
-            &feature.id,
-            ReviewStart {
-                status: Some(ReviewStatus::InProgress),
-                ..ReviewStart::default()
-            },
-        )?;
+        let (review, created) = self.reviews.start_runner_review(&feature.id)?;
         if !created {
             return Ok(review);
         }
 
+        let job_id = review
+            .runner_job_id
+            .clone()
+            .ok_or(LoomError::InvalidSourceCommit)?;
+        self.emit_started(feature, &review, &job_id);
+        self.dispatch(feature, &review)?;
+        Ok(review)
+    }
+
+    /// Resumes monitoring or dispatch for durable automatic reviews left
+    /// incomplete by a Loom process restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns when durable feature or review state cannot be read.
+    pub fn recover(&self) -> Result<usize, LoomError> {
+        let mut recovered = 0;
+        for feature in self.features.list()? {
+            for review in self.reviews.list_for_feature(&feature.id)? {
+                if review.status == ReviewStatus::Completed || review.runner_job_id.is_none() {
+                    continue;
+                }
+                self.spawn_recovery(feature.clone(), review);
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
+    fn dispatch(&self, feature: &Feature, review: &Review) -> Result<(), LoomError> {
+        let candidate = feature
+            .candidate
+            .as_ref()
+            .ok_or(LoomError::InvalidSourceCommit)?;
+        if candidate.id != review.candidate_id {
+            self.finish_failed(feature, review, "review candidate no longer matches");
+            return Err(LoomError::InvalidSourceCommit);
+        }
+        self.revoke_review_tokens(review);
         let repositories = candidate
             .repositories
             .iter()
@@ -164,6 +200,8 @@ impl ReviewDispatcher {
             name: format!("review-{}", review.id),
             repositories: repositories.into_iter().collect(),
             perms: vec![TokenPerm::Evidence, TokenPerm::Review],
+            feature_id: Some(feature.id.clone()),
+            review_id: Some(review.id.clone()),
             expires_at: Some(
                 unix_now()
                     .saturating_add(self.config.timeout_secs)
@@ -172,31 +210,100 @@ impl ReviewDispatcher {
         }) {
             Ok(minted) => minted,
             Err(error) => {
-                self.finish_failed(feature, &review, "review credential mint failed");
+                self.finish_failed(feature, review, "review credential mint failed");
                 return Err(error);
             }
         };
-        let request = match self.runner_request(feature, &review, &minted.secret) {
+        let request = match self.runner_request(feature, review, &minted.secret) {
             Ok(request) => request,
             Err(error) => {
                 let _ = self.authority.tokens().revoke(&minted.token.id);
-                self.finish_failed(feature, &review, "review context is invalid");
+                self.finish_failed(feature, review, "review context is invalid");
                 return Err(error);
             }
         };
-        self.emit_started(feature, &review, &request.job_id);
-
         let dispatcher = self.clone();
-        let feature = feature.clone();
+        let feature_for_task = feature.clone();
         let review_for_task = review.clone();
-        let token_id = minted.token.id;
-        tokio::task::spawn_blocking(move || {
-            dispatcher.run_job(&feature, &review_for_task, &request);
-            if let Err(error) = dispatcher.authority.tokens().revoke(&token_id) {
-                eprintln!("loom: review token revoke failed ({token_id}): {error}");
+        let token_id = minted.token.id.clone();
+        let token_id_for_task = token_id.clone();
+        std::thread::Builder::new()
+            .name(format!("loom-review-{}", review.id))
+            .spawn(move || {
+                dispatcher.run_job(&feature_for_task, &review_for_task, &request);
+                if let Err(error) = dispatcher.authority.tokens().revoke(&token_id_for_task) {
+                    eprintln!("loom: review token revoke failed ({token_id_for_task}): {error}");
+                }
+            })
+            .map_err(|_| {
+                let _ = self.authority.tokens().revoke(&token_id);
+                self.finish_failed(feature, review, "review dispatch thread could not start");
+                LoomError::StorageUnavailable
+            })?;
+        Ok(())
+    }
+
+    fn spawn_recovery(&self, feature: Feature, review: Review) {
+        let dispatcher = self.clone();
+        let thread_name = format!("loom-review-recover-{}", review.id);
+        let failure_feature = feature.clone();
+        let failure_review = review.clone();
+        if std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || dispatcher.recover_one(&feature, &review))
+            .is_err()
+        {
+            self.finish_failed(
+                &failure_feature,
+                &failure_review,
+                "review recovery thread could not start",
+            );
+        }
+    }
+
+    fn recover_one(&self, feature: &Feature, review: &Review) {
+        let Some(job_id) = review.runner_job_id.as_deref() else {
+            return;
+        };
+        if feature
+            .candidate
+            .as_ref()
+            .is_none_or(|candidate| candidate.id != review.candidate_id)
+        {
+            let _ = self.config.grid.cancel(job_id);
+            self.finish_failed(feature, review, "review candidate was superseded");
+            self.revoke_review_tokens(review);
+            return;
+        }
+        match self.config.grid.get(job_id) {
+            Ok(job) if matches!(job.status.as_str(), "passed" | "failed" | "cancelled") => {
+                self.handle_job_outcome(feature, review, Ok(job));
+                self.revoke_review_tokens(review);
             }
-        });
-        Ok(review)
+            Ok(_) => {
+                let outcome = self.config.grid.wait(
+                    job_id,
+                    Duration::from_secs(self.config.timeout_secs.saturating_add(90)),
+                );
+                self.handle_job_outcome(feature, review, outcome);
+                self.revoke_review_tokens(review);
+            }
+            Err(GridRunnerError::Status(404)) => {
+                if let Err(error) = self.dispatch(feature, review)
+                    && !self.review_completed(review)
+                {
+                    self.finish_failed(
+                        feature,
+                        review,
+                        &format!("review recovery dispatch failed: {error}"),
+                    );
+                }
+            }
+            Err(error) => {
+                self.finish_failed(feature, review, &runner_error_message(&error));
+                self.revoke_review_tokens(review);
+            }
+        }
     }
 
     fn runner_request(
@@ -264,6 +371,18 @@ impl ReviewDispatcher {
                 Duration::from_secs(self.config.timeout_secs.saturating_add(90)),
             )
         });
+        if outcome.is_err() {
+            let _ = self.config.grid.cancel(&request.job_id);
+        }
+        self.handle_job_outcome(feature, review, outcome);
+    }
+
+    fn handle_job_outcome(
+        &self,
+        feature: &Feature,
+        review: &Review,
+        outcome: Result<crate::grid_runner::GridRunnerJob, GridRunnerError>,
+    ) {
         match outcome {
             Ok(job) if job.status == "passed" => {
                 if !self.review_completed(review) {
@@ -288,6 +407,16 @@ impl ReviewDispatcher {
                     self.finish_failed(feature, review, &runner_error_message(&error));
                 }
             }
+        }
+    }
+
+    fn revoke_review_tokens(&self, review: &Review) {
+        let name = format!("review-{}", review.id);
+        let Ok(tokens) = self.authority.tokens().list() else {
+            return;
+        };
+        for token in tokens.into_iter().filter(|token| token.name == name) {
+            let _ = self.authority.tokens().revoke(&token.id);
         }
     }
 
@@ -363,7 +492,13 @@ impl ReviewDispatcher {
 fn normalized_service_url(value: &str) -> Result<String, ReviewRunnerConfigError> {
     let value = value.trim().trim_end_matches('/');
     let parsed = reqwest::Url::parse(value).map_err(|_| ReviewRunnerConfigError::Service)?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(ReviewRunnerConfigError::Service);
     }
     Ok(value.to_owned())
@@ -382,26 +517,48 @@ fn safe_review_command(command: &[String]) -> bool {
         return false;
     }
     let mut headless = false;
+    let mut default_permissions = false;
+    let mut web_disabled = false;
+    let mut subagents_disabled = false;
     for (index, arg) in command.iter().enumerate() {
+        let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+        if matches!(
+            name,
+            "--allow"
+                | "--allowedTools"
+                | "--allowed-tools"
+                | "--agent"
+                | "--agents"
+                | "--tools"
+                | "--cwd"
+                | "--worktree"
+                | "--worktree-ref"
+                | "--restore-code"
+                | "--continue"
+                | "--resume"
+                | "--fork-session"
+        ) {
+            return false;
+        }
         if matches!(
             arg.as_str(),
             "-p" | "--single" | "--prompt-file" | "--prompt-json"
         ) {
             headless = true;
         }
+        web_disabled |= arg == "--disable-web-search";
+        subagents_disabled |= arg == "--no-subagents";
         let permission_mode = arg.strip_prefix("--permission-mode=").or_else(|| {
             (arg == "--permission-mode")
                 .then(|| command.get(index + 1))
                 .flatten()
                 .map(String::as_str)
         });
-        if permission_mode.is_some_and(|mode| {
-            matches!(
-                mode.to_ascii_lowercase().as_str(),
-                "auto" | "always-approve" | "dontask" | "bypasspermissions"
-            )
-        }) {
-            return false;
+        if let Some(mode) = permission_mode {
+            if !mode.eq_ignore_ascii_case("default") {
+                return false;
+            }
+            default_permissions = true;
         }
         let sandbox = arg.strip_prefix("--sandbox=").or_else(|| {
             (arg == "--sandbox")
@@ -413,7 +570,7 @@ fn safe_review_command(command: &[String]) -> bool {
             return false;
         }
     }
-    headless
+    headless && default_permissions && web_disabled && subagents_disabled
 }
 
 fn feature_repositories(feature: &Feature) -> impl Iterator<Item = String> + '_ {
@@ -464,6 +621,7 @@ mod tests {
 
     use super::{ReviewRunnerConfig, ReviewRunnerConfigError, safe_review_command};
     use crate::auth::AccessToken;
+    use crate::ci::CiEngine;
     use crate::contracts::RepositoryBinding;
     use crate::events::EventLog;
     use crate::features::{EvidencePolicy, FeatureCreate, FeatureStore, Scenario};
@@ -480,6 +638,8 @@ mod tests {
             "nero".to_owned(),
             "--permission-mode".to_owned(),
             "default".to_owned(),
+            "--disable-web-search".to_owned(),
+            "--no-subagents".to_owned(),
             "--single".to_owned(),
             "Review the feature identified by FEATURE_ID".to_owned(),
         ]));
@@ -492,6 +652,7 @@ mod tests {
             vec!["nero", "--permission-mode=always-approve"],
             vec!["nero", "--permission-mode=auto"],
             vec!["nero", "--sandbox", "danger-full-access"],
+            vec!["nero", "--allow", "Bash(*)", "--single", "review"],
             vec!["sh", "-c", "nero"],
         ] {
             let command = unsafe_args
@@ -506,12 +667,27 @@ mod tests {
     fn explicit_config_is_fail_closed() {
         let command = vec![
             "nero".to_owned(),
+            "--permission-mode".to_owned(),
+            "default".to_owned(),
+            "--disable-web-search".to_owned(),
+            "--no-subagents".to_owned(),
             "--single".to_owned(),
             "review".to_owned(),
         ];
         assert_eq!(
             ReviewRunnerConfig::new("", "token", "https://loom.test", command.clone(), 60)
                 .unwrap_err(),
+            ReviewRunnerConfigError::Service
+        );
+        assert_eq!(
+            ReviewRunnerConfig::new(
+                "https://user:secret@grid.test",
+                "token",
+                "https://loom.test",
+                command.clone(),
+                60,
+            )
+            .unwrap_err(),
             ReviewRunnerConfigError::Service
         );
         assert_eq!(
@@ -628,6 +804,8 @@ mod tests {
                 "nero".to_owned(),
                 "--permission-mode".to_owned(),
                 "default".to_owned(),
+                "--disable-web-search".to_owned(),
+                "--no-subagents".to_owned(),
                 "--single".to_owned(),
                 "Review the candidate identified by FEATURE_ID".to_owned(),
             ],
@@ -728,6 +906,114 @@ mod tests {
                 "review.completed",
             ]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovers_monitoring_without_dispatching_a_duplicate_grid_job() {
+        let mock = MockGrid::default();
+        let app = Router::new()
+            .route("/internal/runners", post(create_runner))
+            .route("/internal/runners/{id}", get(get_runner))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("loom");
+        let store = PersistentLoomStore::open(&root).unwrap();
+        let grant = NamespaceGrant::new(BTreeSet::from(["demo".to_owned()]));
+        let base = store
+            .commit(
+                &grant,
+                "demo",
+                None,
+                BTreeMap::from([("README.md".to_owned(), b"base\n".to_vec())]),
+            )
+            .unwrap();
+        let head = store
+            .commit(
+                &grant,
+                "demo",
+                Some(&base),
+                BTreeMap::from([("README.md".to_owned(), b"candidate\n".to_vec())]),
+            )
+            .unwrap();
+        store
+            .create_ref(&grant, "demo", "refs/main", &base)
+            .unwrap();
+        let features = FeatureStore::new(store.clone());
+        let feature = features
+            .create(FeatureCreate {
+                title: "recover review".to_owned(),
+                repositories: vec![RepositoryBinding::new(base.clone(), "refs/main".to_owned())],
+                scenarios: vec![Scenario {
+                    name: "recover".to_owned(),
+                    given: "a durable review".to_owned(),
+                    when: "Loom restarts".to_owned(),
+                    then: "the existing Grid job is monitored".to_owned(),
+                }],
+                evidence_policy: EvidencePolicy::minimum(),
+            })
+            .unwrap();
+        features.approve(&feature.id).unwrap();
+        let bindings = vec![RepositoryBinding::new(base, "refs/main".to_owned()).with_head(head)];
+        let ci = CiEngine::new(store.clone());
+        let job = ci.run(&feature.id, &bindings).unwrap();
+        let candidate = ci.candidate_from_job(&job, bindings).unwrap();
+        features.attach_candidate(&feature.id, candidate).unwrap();
+        let reviews = ReviewStore::new(store.clone());
+        let (review, created) = reviews.start_runner_review(&feature.id).unwrap();
+        assert!(created);
+        let expected_job_id = format!("rev-{}", review.id);
+        assert_eq!(
+            review.runner_job_id.as_deref(),
+            Some(expected_job_id.as_str())
+        );
+
+        let config = ReviewRunnerConfig::new(
+            format!("http://{address}"),
+            "grid-internal",
+            "https://loom.test",
+            vec![
+                "nero".to_owned(),
+                "--permission-mode".to_owned(),
+                "default".to_owned(),
+                "--disable-web-search".to_owned(),
+                "--no-subagents".to_owned(),
+                "--single".to_owned(),
+                "Review FEATURE_ID".to_owned(),
+            ],
+            60,
+        )
+        .unwrap();
+        let _loom = LoomApp::new(ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            root,
+            token: AccessToken::new("owner"),
+            deploy_token: None,
+            origin: OriginConfig::for_test(directory.path().join("origin"), true),
+            git_program: PathBuf::from("/usr/bin/git"),
+            hook_program: PathBuf::from("/bin/true"),
+            review_runner: Some(config),
+        })
+        .unwrap();
+
+        for _ in 0..100 {
+            if reviews
+                .get(&feature.id, &review.id)
+                .is_ok_and(|current| current.status == ReviewStatus::Completed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let completed = reviews.get(&feature.id, &review.id).unwrap();
+        assert_eq!(completed.verdict, Some(ReviewVerdict::Comment));
+        assert!(mock.request.lock().unwrap().is_none());
         server.abort();
     }
 }
