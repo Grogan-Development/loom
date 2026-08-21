@@ -1,7 +1,9 @@
 //! Durable event log, scoped-token filtering, and live SSE tail.
 #![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use axum::{
@@ -9,11 +11,12 @@ use axum::{
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt as _;
-use loom::PersistentLoomStore;
 use loom::auth::AccessToken;
 use loom::events::EventLog;
+use loom::git::GitBridge;
 use loom::origin::OriginConfig;
 use loom::server::{LoomApp, ServerConfig};
+use loom::{NamespaceGrant, PersistentLoomStore};
 use tower::ServiceExt as _;
 
 const OWNER: &str = "owner-token";
@@ -109,6 +112,82 @@ fn feature_create_body(repository: &str) -> serde_json::Value {
             "name": "s", "given": "g", "when": "w", "then": "t",
         }],
     })
+}
+
+fn git(args: &[&str], cwd: &Path) -> String {
+    let output = Command::new("/usr/bin/git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn git_import_emits_push_received_after_cas_completion() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PersistentLoomStore::open(directory.path().join("loom")).unwrap();
+    let bridge = GitBridge::new(
+        store.clone(),
+        Path::new("/usr/bin/git"),
+        Path::new("/bin/true"),
+    )
+    .unwrap();
+    let bare = bridge.ensure_repository("demo").unwrap();
+
+    // Build one real commit and push its objects into the bare repository,
+    // exactly as receive-pack would have before running the pre-receive hook.
+    let work = directory.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&["init", "--quiet"], &work);
+    std::fs::write(work.join("README.md"), b"pushed\n").unwrap();
+    git(&["add", "."], &work);
+    git(&["commit", "--quiet", "-m", "pushed"], &work);
+    let oid = git(&["rev-parse", "HEAD"], &work).trim().to_owned();
+    git(
+        &[
+            "push",
+            "--quiet",
+            bare.to_str().unwrap(),
+            "HEAD:refs/heads/workspaces/x",
+        ],
+        &work,
+    );
+
+    let grant = NamespaceGrant::new(BTreeSet::from(["demo".to_owned()]));
+    let input = format!("{} {oid} refs/heads/workspaces/x\n", "0".repeat(40));
+    let admitted = bridge
+        .import_pre_receive(&grant, "demo", input.as_bytes())
+        .unwrap();
+    assert_eq!(admitted.len(), 1);
+
+    // The CAS import completed, so exactly one durable push.received exists.
+    let events = EventLog::new(store).since(None, 100).unwrap();
+    let pushes = events
+        .iter()
+        .filter(|event| event.kind == "push.received")
+        .collect::<Vec<_>>();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0].repos, vec!["demo".to_owned()]);
+    assert_eq!(pushes[0].payload["repo"], "demo");
+    assert_eq!(pushes[0].payload["updates"][0]["git_oid"], oid);
+    assert_eq!(
+        pushes[0].payload["updates"][0]["ref_name"],
+        "refs/heads/workspaces/x"
+    );
+    assert_eq!(
+        pushes[0].payload["updates"][0]["revision"],
+        admitted[0].revision
+    );
 }
 
 #[test]

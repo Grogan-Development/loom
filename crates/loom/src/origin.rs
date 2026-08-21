@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::catalog::{RepoCatalog, RepoEntry, seed_entries};
+use crate::catalog::{DeployTarget, RepoCatalog, RepoEntry, seed_entries};
 use crate::ci::{CiEngine, CiStatus, truncate_log};
 use crate::contracts::RepositoryRevision;
 use crate::deploy::apply_release;
+use crate::events::EventLog;
 use crate::{LoomError, PersistentLoomStore, hex_digest, read_bounded, write_atomic};
 
 const MAX_ORIGIN_BYTES: u64 = 4 * 1024 * 1024;
@@ -538,6 +539,22 @@ impl OriginEngine {
             return Ok(release);
         }
         let log = apply_release(&self.config, &entry.deploy_target, repository, oid)?;
+        let target_kind = match entry.deploy_target {
+            DeployTarget::None => "none",
+            DeployTarget::LocalApply { .. } => "local_apply",
+            DeployTarget::SshApply { .. } => "ssh_apply",
+        };
+        if let Err(error) = EventLog::new(self.store.clone()).emit(
+            "deploy.applied",
+            [repository],
+            serde_json::json!({
+                "repo": repository,
+                "git_oid": oid,
+                "deploy_target": target_kind,
+            }),
+        ) {
+            eprintln!("loom: event emit failed (deploy.applied): {error}");
+        }
         release.log = truncate_log(&format!("{}\n{log}", release.log));
         release.deployed_oid = Some(oid.to_owned());
         self.upsert(release)

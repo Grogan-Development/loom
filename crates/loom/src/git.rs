@@ -14,6 +14,7 @@ use std::{
 
 use crate::catalog::RepoCatalog;
 use crate::contracts::RepositoryRevision;
+use crate::events::EventLog;
 use crate::tokens::{Authority, TokenPerm};
 use axum::{
     Router,
@@ -397,12 +398,29 @@ impl GitBridge {
             validate_oid(&update.new_oid)?;
         }
         let mut admitted = Vec::new();
+        let mut received = Vec::new();
         for update in updates {
             if is_zero_oid(&update.new_oid) {
                 continue;
             }
             let revision = self.import_git_commit(grant, repository, &bare, &update.new_oid)?;
+            received.push(serde_json::json!({
+                "ref_name": update.ref_name,
+                "git_oid": update.new_oid,
+                "revision": revision.revision,
+            }));
             admitted.push(revision);
+        }
+        // The CAS import is complete: every pushed commit is admitted and
+        // durably mapped, so record the push in the durable event log.
+        if !admitted.is_empty()
+            && let Err(error) = EventLog::new(self.store.clone()).emit(
+                "push.received",
+                [repository],
+                serde_json::json!({ "repo": repository, "updates": received }),
+            )
+        {
+            eprintln!("loom: event emit failed (push.received): {error}");
         }
         Ok(admitted)
     }

@@ -403,6 +403,31 @@ async fn ci_route_executes_pipeline_and_records_honest_results() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    // The successful apply left exactly one durable deploy.applied event;
+    // the blocked deploy for the failing SHA left none.
+    let (status, page) = send(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri("/v1/events")
+            .header("authorization", format!("Bearer {OWNER}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let applied = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "deploy.applied")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(applied.len(), 1, "{page}");
+    assert_eq!(applied[0]["repos"][0], "loom");
+    assert_eq!(applied[0]["payload"]["git_oid"], PASS_OID);
+    assert_eq!(applied[0]["payload"]["deploy_target"], "local_apply");
 }
 
 #[test]

@@ -1,9 +1,10 @@
 //! Durable append-only Loom event log and live broadcast.
 //!
-//! Git `push.received` / `refs.moved` are not emitted from `git.rs`: the
-//! receive-pack success path is the pre-receive hook (refs are not yet moved)
-//! plus `git-http-backend` (no single post-import callback). Feature
-//! acceptance emits `refs.moved` after a successful protected-ref CAS.
+//! `push.received` is emitted from `git.rs` once a pre-receive batch has
+//! fully completed its CAS import (durable log only; the import runs in the
+//! hook process, outside this process's live broadcast). Feature acceptance
+//! emits `refs.moved` after a successful protected-ref CAS, and
+//! `deploy.applied` follows a successful release apply.
 //!
 //! Known kinds: `push.received`, `feature.created`, `feature.approved`,
 //! `feature.accepted`, `feature.rejected`, `candidate.submitted`,
