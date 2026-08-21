@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::contracts::{ArtifactDigest, RepositoryBinding};
 use crate::features::{Candidate, EvidenceBundle, candidate_source_key};
+use crate::grid_runner::{CreateRunnerRequest, GridRepo, GridRunner, grid_backend_requested};
 use crate::{
     CandidateRevisionStatus, LoomError, NamespaceGrant, PersistentLoomStore, SourceFileMode,
     digest_bytes, read_bounded, write_atomic,
@@ -170,7 +171,7 @@ impl CiEngine {
             evidence_digest: None,
         };
         self.upsert(&job)?;
-        match self.execute(bindings) {
+        match self.execute(bindings, &job.id) {
             Ok((passed, log)) => {
                 job.log = truncate_log(&log);
                 job.status = if passed {
@@ -215,6 +216,7 @@ impl CiEngine {
                 job_id: job.id.clone(),
                 log: job.log.clone(),
             },
+            insights: None, // insights-slice
         })
     }
 
@@ -227,7 +229,14 @@ impl CiEngine {
             .find(|job| job.source_key == source_key && job.status == CiStatus::Passed))
     }
 
-    fn execute(&self, bindings: &[RepositoryBinding]) -> Result<(bool, String), LoomError> {
+    fn execute(
+        &self,
+        bindings: &[RepositoryBinding],
+        job_id: &str,
+    ) -> Result<(bool, String), LoomError> {
+        if grid_backend_requested() {
+            return execute_on_grid(bindings, job_id);
+        }
         let grant = NamespaceGrant::new(
             bindings
                 .iter()
@@ -302,6 +311,53 @@ impl CiEngine {
             .map(|job| (job.id.clone(), job))
             .collect())
     }
+}
+
+fn execute_on_grid(
+    bindings: &[RepositoryBinding],
+    job_id: &str,
+) -> Result<(bool, String), LoomError> {
+    let runner = match GridRunner::from_env() {
+        Ok(runner) => runner,
+        Err(error) => return Ok((false, error.to_string())),
+    };
+    let mut repos = Vec::new();
+    for binding in bindings {
+        let head = binding
+            .head
+            .as_ref()
+            .ok_or(LoomError::InvalidSourceCommit)?;
+        repos.push(GridRepo {
+            repo: head.repository.clone(),
+            revision: head.revision.clone(),
+        });
+    }
+    let timeout_secs = DEFAULT_TIMEOUT_SECS.max(600);
+    let created = match runner.create(&CreateRunnerRequest {
+        job_id: job_id.to_owned(),
+        kind: "ci".to_owned(),
+        repos,
+        timeout_secs,
+        env: BTreeMap::new(),
+        commands: Vec::new(),
+    }) {
+        Ok(created) => created,
+        Err(error) => return Ok((false, error.to_string())),
+    };
+    let finished = match runner.wait(
+        &created.id,
+        Duration::from_secs(timeout_secs.saturating_add(90)),
+    ) {
+        Ok(finished) => finished,
+        Err(error) => return Ok((false, error.to_string())),
+    };
+    let passed = finished.status == "passed";
+    let mut log = finished.log;
+    if let Some(error) = finished.error.filter(|value| !value.is_empty()) {
+        log.push('\n');
+        log.push_str(&error);
+    }
+    Ok((passed, log))
 }
 
 fn write_tree(

@@ -4,9 +4,13 @@ pub mod auth;
 pub mod ci;
 pub mod contracts;
 pub mod deploy;
+pub mod events;
 pub mod features;
 pub mod git;
+pub mod grid_runner;
+pub mod insights; // insights-slice
 pub mod origin;
+pub mod review;
 pub mod server;
 pub mod tokens;
 

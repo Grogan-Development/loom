@@ -1,4 +1,4 @@
-//! Origin webhook, SHA-keyed CI evidence, fail-closed deploy, and loom-ci.toml.
+//! Origin webhook (verify-only), Loom-keyed release/deploy, and mirror queue.
 #![allow(clippy::unwrap_used)]
 
 use std::path::PathBuf;
@@ -13,7 +13,8 @@ use loom::PersistentLoomStore;
 use loom::auth::AccessToken;
 use loom::ci::{CiStatus, execute_command, load_pipeline};
 use loom::origin::{
-    OriginConfig, OriginEngine, OriginRelease, test_verifying_key, test_webhook_signature,
+    OriginConfig, OriginEngine, OriginMirrorRunner, OriginMirrorStatus, OriginRelease,
+    test_verifying_key, test_webhook_signature,
 };
 use loom::server::{LoomApp, ServerConfig};
 use tower::ServiceExt as _;
@@ -47,6 +48,21 @@ fn test_app(passed: bool, webhook_secret: Option<[u8; 32]>) -> (tempfile::TempDi
     })
     .unwrap();
     (directory, app.router())
+}
+
+fn test_engine(mirror_ok: bool) -> (tempfile::TempDir, OriginEngine) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = OriginConfig::for_test(directory.path().join("work"), true);
+    config.mirror_runner = OriginMirrorRunner::Fixed {
+        ok: mirror_ok,
+        log: if mirror_ok {
+            "mirror.ok".to_owned()
+        } else {
+            "mirror.error".to_owned()
+        },
+    };
+    let store = PersistentLoomStore::open(directory.path().join("loom")).unwrap();
+    (directory, OriginEngine::new(store, config))
 }
 
 async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -93,7 +109,7 @@ async fn webhook_rejects_missing_and_invalid_signatures() {
 }
 
 #[tokio::test]
-async fn webhook_accepts_signed_origin_payload() {
+async fn webhook_accepts_signed_payload_without_starting_ci() {
     let secret = [9_u8; 32];
     let (_directory, router) = test_app(true, Some(secret));
     let body = format!(
@@ -113,7 +129,19 @@ async fn webhook_accepts_signed_origin_payload() {
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/v1/releases/loom/{OID}"))
+            .header("authorization", format!("Bearer {OWNER}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// Envelope and payload shapes exactly as Origin delivers them
@@ -128,7 +156,7 @@ fn webhook_targets_parse_origin_pull_request_shape() {
 }
 
 /// Origin push events carry a `refUpdates` array, not top-level `ref`/`after`.
-/// Only updates to `main` trigger CI; branch pushes and deletions do not.
+/// Only updates to `main` are parsed; branch pushes and deletions are ignored.
 #[test]
 fn webhook_targets_parse_origin_ref_updates_shape() {
     let body = format!(
@@ -168,7 +196,7 @@ async fn deploy_is_rejected_without_passing_evidence_and_without_deploy_token() 
 }
 
 #[tokio::test]
-async fn owner_ci_records_sha_keyed_evidence_and_deploy_token_applies() {
+async fn loom_release_record_allows_deploy_token_to_apply() {
     let (_directory, router) = test_app(true, None);
     let (status, body) = send(
         &router,
@@ -184,6 +212,7 @@ async fn owner_ci_records_sha_keyed_evidence_and_deploy_token_applies() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["tests_passed"], true);
     assert_eq!(body["status"], "passed");
+    assert_eq!(body["log"], "origin.mirror_only");
 
     let (status, body) = send(
         &router,
@@ -210,6 +239,17 @@ async fn owner_ci_records_sha_keyed_evidence_and_deploy_token_applies() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[test]
+fn record_loom_release_is_accept_equivalent_for_deploy() {
+    let (_directory, origin) = test_engine(true);
+    origin.record_loom_release("loom", OID, true).unwrap();
+    let release = origin.release("loom", OID).unwrap().unwrap();
+    assert!(release.tests_passed);
+    assert_eq!(release.status, CiStatus::Passed);
+    let deployed = origin.deploy("loom", OID).unwrap();
+    assert_eq!(deployed.deployed_oid.as_deref(), Some(OID));
 }
 
 #[test]
@@ -241,6 +281,50 @@ fn sha_keyed_release_lookup_round_trips() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn queue_mirror_fixed_runner_records_ok_without_network() {
+    let (_directory, origin) = test_engine(true);
+    let job = origin.queue_mirror("nero", Some(OID)).unwrap();
+    assert_eq!(job.status, OriginMirrorStatus::Ok);
+    assert_eq!(job.git_oid.as_deref(), Some(OID));
+    assert_eq!(job.log, "mirror.ok");
+    let listed = origin.mirrors().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, job.id);
+}
+
+#[test]
+fn queue_mirror_fixed_runner_records_error_without_network() {
+    let (_directory, origin) = test_engine(false);
+    let job = origin.queue_mirror("grid", Some(OID)).unwrap();
+    assert_eq!(job.status, OriginMirrorStatus::Error);
+    assert_eq!(job.log, "mirror.error");
+}
+
+#[test]
+fn queue_mirror_without_git_mapping_records_error() {
+    let (_directory, origin) = test_engine(true);
+    let job = origin.queue_mirror("loom", None).unwrap();
+    assert_eq!(job.status, OriginMirrorStatus::Error);
+    assert_eq!(job.log, "no git mapping");
+    assert!(job.git_oid.is_none());
+}
+
+#[test]
+fn unknown_repo_is_denied_for_release_and_mirror() {
+    let (_directory, origin) = test_engine(true);
+    let denied = origin.record_loom_release("secret", OID, true).unwrap_err();
+    assert!(matches!(
+        denied,
+        loom::LoomError::OriginRepositoryDenied { repository } if repository == "secret"
+    ));
+    let denied = origin.queue_mirror("secret", Some(OID)).unwrap_err();
+    assert!(matches!(
+        denied,
+        loom::LoomError::OriginRepositoryDenied { repository } if repository == "secret"
+    ));
 }
 
 #[test]

@@ -7,21 +7,31 @@ use std::path::{Path, PathBuf};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path as AxumPath, Request, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event as SseEvent, KeepAlive, Sse},
+    },
     routing::{delete, get, post},
 };
-use serde::Serialize;
+use futures_util::stream::{self, StreamExt as _};
+use serde::{Deserialize, Serialize};
 
 use crate::auth::{AccessToken, bearer_token};
 use crate::ci::CiEngine;
+use crate::events::{DEFAULT_CATCH_UP, Event, EventLog, MAX_CATCH_UP};
 use crate::features::{CandidateSubmit, Feature, FeatureCreate, FeatureStore, promotion_updates};
 use crate::git::{GitBridge, GitHttpGateway};
-use crate::origin::{OriginCiRequest, OriginConfig, OriginEngine, OriginEvidence};
+use crate::insights::InsightsEngine; // insights-slice
+use crate::origin::{OriginCiRequest, OriginConfig, OriginEngine, OriginEvidence, OriginMirrorJob};
+use crate::review::{
+    CommentCreate, FindingApply, FindingsAppend, ReviewComplete, ReviewStart, ReviewStore,
+};
 use crate::tokens::{Authority, Principal, TokenMint, TokenPerm, TokenStore};
 use crate::{AtomicRefResult, LoomError, LoomRpc, NamespaceGrant, PersistentLoomStore};
+use tokio::sync::broadcast;
 
 /// Runtime configuration for the combined Loom server.
 #[derive(Debug, Clone)]
@@ -48,9 +58,12 @@ struct AppState {
     deploy_token: Option<AccessToken>,
     authority: Authority,
     features: FeatureStore,
+    reviews: ReviewStore,
     ci: CiEngine,
+    insights: InsightsEngine, // insights-slice
     origin: OriginEngine,
     store: PersistentLoomStore,
+    events: EventLog, // events-slice
 }
 
 /// Combined Loom process: native RPC + features + lightning CI + Git HTTP.
@@ -68,7 +81,9 @@ impl LoomApp {
     pub fn new(config: ServerConfig) -> Result<Self, LoomError> {
         let store = PersistentLoomStore::open(&config.root)?;
         let features = FeatureStore::new(store.clone());
+        let reviews = ReviewStore::new(store.clone());
         let ci = CiEngine::new(store.clone());
+        let insights = InsightsEngine::new(store.clone()); // insights-slice
         let authority = Authority::new(config.token.clone(), TokenStore::new(store.clone()));
         let token_state = TokenState(config.token.clone());
         let rpc = LoomRpc::new(store.clone())
@@ -80,25 +95,55 @@ impl LoomApp {
                 |bridge| GitHttpGateway::new(bridge, authority.clone()).router(),
             );
         let origin = OriginEngine::new(store.clone(), config.origin);
+        let events = EventLog::new(store.clone()); // events-slice
         let state = AppState {
             token: config.token,
             deploy_token: config.deploy_token,
             authority,
             features,
+            reviews,
             ci,
+            insights,
             origin,
             store,
+            events,
         };
         let api = Router::new()
             .route("/healthz", get(healthz))
             .route("/v1/tokens", get(list_tokens).post(mint_token))
             .route("/v1/tokens/{id}", delete(revoke_token))
+            .route("/v1/events", get(list_events)) // events-slice
             .route("/v1/features", get(list_features).post(create_feature))
             .route("/v1/features/{id}", get(get_feature))
             .route("/v1/features/{id}/approve", post(approve_feature))
             .route("/v1/features/{id}/candidates", post(submit_candidate))
+            .route("/v1/features/{id}/insights", get(get_insights)) // insights-slice
             .route("/v1/features/{id}/accept", post(accept_feature))
             .route("/v1/features/{id}/reject", post(reject_feature))
+            .route(
+                "/v1/features/{id}/reviews",
+                get(list_reviews).post(create_review),
+            )
+            .route(
+                "/v1/features/{id}/reviews/{rid}/findings",
+                post(append_findings),
+            )
+            .route(
+                "/v1/features/{id}/reviews/{rid}/complete",
+                post(complete_review),
+            )
+            .route(
+                "/v1/features/{id}/findings/{fid}/approve",
+                post(approve_finding),
+            )
+            .route(
+                "/v1/features/{id}/findings/{fid}/apply",
+                post(apply_finding),
+            )
+            .route(
+                "/v1/features/{id}/comments",
+                get(list_comments).post(create_comment),
+            )
             .route("/v1/origin/webhook", post(origin_webhook))
             .route("/v1/releases/{repo}/ci", post(origin_start_ci))
             .route("/v1/releases/{repo}/{oid}", get(origin_get_release))
@@ -106,6 +151,7 @@ impl LoomApp {
                 "/v1/releases/{repo}/{oid}/deploy",
                 post(origin_deploy_release),
             )
+            .route("/v1/mirrors", get(origin_list_mirrors))
             .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
             .with_state(state);
         let router = Router::new().merge(api).merge(rpc).nest("/git", git_router);
@@ -214,34 +260,21 @@ async fn origin_webhook(
     let webhook_id = header_str(&headers, "webhook-id");
     let timestamp = header_str(&headers, "webhook-timestamp");
     let signature = header_str(&headers, "webhook-signature");
-    if state
-        .origin
-        .verify_webhook(webhook_id, timestamp, signature, &body)
-        .await
-        .is_err()
+    if !state.origin.config().webhook_keys.is_empty()
+        && state
+            .origin
+            .verify_webhook(webhook_id, timestamp, signature, &body)
+            .await
+            .is_err()
     {
         return unauthorized();
     }
-    // Receipt log for verified deliveries: non-CI events (installation.*,
-    // pull_request.closed, ...) would otherwise leave no operational trace.
     let excerpt: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     eprintln!(
-        "loom: origin webhook verified ({} bytes): {excerpt}",
+        "loom: origin webhook ignored (mirror_only, {} bytes): {excerpt}",
         body.len()
     );
-    let origin = state.origin.clone();
-    let targets = OriginEngine::targets_from_webhook(&body);
-    tokio::spawn(async move {
-        for (repository, oid) in targets {
-            let job = origin.clone();
-            match tokio::task::spawn_blocking(move || job.run_ci(&repository, &oid)).await {
-                Ok(Ok(release)) => origin.publish_check(&release).await,
-                Ok(Err(error)) => eprintln!("loom: origin webhook ci failed: {error}"),
-                Err(error) => eprintln!("loom: origin webhook join failed: {error}"),
-            }
-        }
-    });
-    StatusCode::ACCEPTED.into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn origin_start_ci(
@@ -255,10 +288,7 @@ async fn origin_start_ci(
     }
     let origin = state.origin.clone();
     match tokio::task::spawn_blocking(move || origin.run_ci(&repo, &request.git_oid)).await {
-        Ok(Ok(release)) => {
-            state.origin.publish_check(&release).await;
-            Json(OriginEvidence::from(&release)).into_response()
-        }
+        Ok(Ok(release)) => Json(OriginEvidence::from(&release)).into_response(),
         Ok(Err(LoomError::OriginRepositoryDenied { .. })) => {
             feature_error(StatusCode::NOT_FOUND, "origin.repository_denied")
         }
@@ -312,6 +342,21 @@ async fn origin_deploy_release(
         Ok(Err(_)) => feature_error(StatusCode::CONFLICT, "origin.deploy_failed"),
         Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "origin.unavailable"),
     }
+}
+
+async fn origin_list_mirrors(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.origin.mirrors() {
+        Ok(jobs) => Json(MirrorList { jobs }).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "origin.unavailable"),
+    }
+}
+
+#[derive(Serialize)]
+struct MirrorList {
+    jobs: Vec<OriginMirrorJob>,
 }
 
 fn require_token(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
@@ -450,7 +495,10 @@ async fn create_feature(
         return forbidden();
     }
     match state.features.create(request) {
-        Ok(feature) => (StatusCode::CREATED, Json(feature)).into_response(),
+        Ok(feature) => {
+            emit_feature(&state.events, "feature.created", &feature);
+            (StatusCode::CREATED, Json(feature)).into_response()
+        }
         Err(LoomError::InvalidRef { ref_name }) => feature_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!("invalid ref {ref_name}"),
@@ -489,7 +537,10 @@ async fn approve_feature(
         return *response;
     }
     match state.features.approve(&id) {
-        Ok(feature) => Json(feature).into_response(),
+        Ok(feature) => {
+            emit_feature(&state.events, "feature.approved", &feature);
+            Json(feature).into_response()
+        }
         Err(LoomError::UnknownRevision { .. }) => {
             feature_error(StatusCode::NOT_FOUND, "feature.not_found")
         }
@@ -523,15 +574,95 @@ async fn submit_candidate(
     if feature.gate != crate::features::FeatureGate::Approved {
         return feature_error(StatusCode::CONFLICT, "feature.invalid_transition");
     }
+    let repos = feature_repositories(&feature)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    emit_json(
+        &state.events,
+        "ci.started",
+        repos.clone(),
+        serde_json::json!({ "id": id, "title": feature.title }),
+    );
     let Ok(job) = state.ci.run(&id, &request.repositories) else {
+        emit_json(
+            &state.events,
+            "ci.finished",
+            repos,
+            serde_json::json!({ "id": id, "status": "failed" }),
+        );
         return feature_error(StatusCode::CONFLICT, "ci.not_ready");
     };
+    emit_json(
+        &state.events,
+        "ci.finished",
+        repos,
+        serde_json::json!({
+            "id": id,
+            "job_id": job.id,
+            "status": job.status,
+        }),
+    );
     match state.ci.candidate_from_job(&job, request.repositories) {
-        Ok(candidate) => match state.features.attach_candidate(&id, candidate) {
-            Ok(feature) => Json(feature).into_response(),
-            Err(_) => feature_error(StatusCode::CONFLICT, "feature.invalid_transition"),
-        },
+        Ok(mut candidate) => {
+            // insights-slice: advisory pre-flight after CI; never blocks the candidate.
+            match state.insights.run(&id, &candidate.repositories) {
+                Ok(bundle) => {
+                    if let Ok(insights_ref) = state.insights.ref_for(&bundle) {
+                        InsightsEngine::attach_to_candidate(&mut candidate, insights_ref);
+                    }
+                    emit_json(
+                        &state.events,
+                        "insights.ready",
+                        feature_repositories(&feature).map(str::to_owned),
+                        serde_json::json!({
+                            "id": id,
+                            "digest": bundle.digest,
+                            "error": bundle.error,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    emit_json(
+                        &state.events,
+                        "insights.ready",
+                        feature_repositories(&feature).map(str::to_owned),
+                        serde_json::json!({
+                            "id": id,
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+            }
+            match state.features.attach_candidate(&id, candidate) {
+                Ok(feature) => {
+                    emit_feature(&state.events, "candidate.submitted", &feature);
+                    Json(feature).into_response()
+                }
+                Err(_) => feature_error(StatusCode::CONFLICT, "feature.invalid_transition"),
+            }
+        }
         Err(_) => feature_error(StatusCode::CONFLICT, "ci.failed"),
+    }
+}
+
+async fn get_insights(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let Ok(feature) = state.features.get(&id) else {
+        return feature_error(StatusCode::NOT_FOUND, "feature.not_found");
+    };
+    if !principal.allows(TokenPerm::Evidence, feature_repositories(&feature)) {
+        return forbidden();
+    }
+    match state.insights.bundle_for_feature(&feature) {
+        Ok(bundle) => Json(bundle).into_response(),
+        Err(_) => feature_error(StatusCode::NOT_FOUND, "insights.not_found"),
     }
 }
 
@@ -546,6 +677,10 @@ async fn accept_feature(
     let Ok(feature) = state.features.get(&id) else {
         return feature_error(StatusCode::NOT_FOUND, "feature.not_found");
     };
+    // review-slice
+    if feature.evidence_policy.review_blocking && !state.reviews.blocking_ok(&id) {
+        return feature_error(StatusCode::CONFLICT, "review.blocking");
+    }
     let Some(candidate) = feature.candidate.as_ref() else {
         return feature_error(StatusCode::CONFLICT, "feature.candidate_missing");
     };
@@ -568,13 +703,60 @@ async fn accept_feature(
         }
         Err(_) => return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "loom.promotion_invalid"),
     };
+    emit_json(
+        &state.events,
+        "refs.moved",
+        updates.iter().map(|update| update.repository.clone()),
+        serde_json::json!({
+            "refs": updates.iter().map(|update| serde_json::json!({
+                "repo": update.repository,
+                "ref_name": update.ref_name,
+                "revision": update.head.revision,
+            })).collect::<Vec<_>>(),
+        }),
+    );
     match state.features.accept(&id, rollback) {
-        Ok(feature) => Json(AcceptedFeature {
-            feature,
-            read_back: true,
-        })
-        .into_response(),
+        Ok(feature) => {
+            emit_feature(&state.events, "feature.accepted", &feature);
+            // origin-slice: Loom evidence is the deploy key; Origin is a backup mirror.
+            record_origin_mirrors(&state.origin, candidate.evidence.tests_passed, &updates);
+            Json(AcceptedFeature {
+                feature,
+                read_back: true,
+            })
+            .into_response()
+        }
         Err(_) => feature_error(StatusCode::CONFLICT, "feature.invalid_transition"),
+    }
+}
+
+/// origin-slice: after `refs/main` CAS for loom|nero|grid, mint a release and queue a mirror.
+fn record_origin_mirrors(
+    origin: &OriginEngine,
+    tests_passed: bool,
+    updates: &[crate::RefCasUpdate],
+) {
+    for update in updates {
+        if !OriginEngine::is_main_promotion(&update.ref_name)
+            || !OriginEngine::is_allowlisted(&update.repository)
+        {
+            continue;
+        }
+        let git_oid = origin.git_oid_for_revision(&update.repository, &update.head);
+        if let Some(oid) = git_oid.as_deref()
+            && let Err(error) = origin.record_loom_release(&update.repository, oid, tests_passed)
+        {
+            eprintln!(
+                "loom: origin release record failed for {}@{oid}: {error}",
+                update.repository
+            );
+        }
+        if let Err(error) = origin.queue_mirror(&update.repository, git_oid.as_deref()) {
+            eprintln!(
+                "loom: origin mirror queue failed for {}: {error}",
+                update.repository
+            );
+        }
     }
 }
 
@@ -587,7 +769,10 @@ async fn reject_feature(
         return *response;
     }
     match state.features.reject(&id) {
-        Ok(feature) => Json(feature).into_response(),
+        Ok(feature) => {
+            emit_feature(&state.events, "feature.rejected", &feature);
+            Json(feature).into_response()
+        }
         Err(LoomError::UnknownRevision { .. }) => {
             feature_error(StatusCode::NOT_FOUND, "feature.not_found")
         }
@@ -595,10 +780,291 @@ async fn reject_feature(
     }
 }
 
+fn require_feature_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<Feature, Box<Response>> {
+    let principal = resolve_principal(state, headers)?;
+    let Ok(feature) = state.features.get(id) else {
+        return Err(Box::new(feature_error(
+            StatusCode::NOT_FOUND,
+            "feature.not_found",
+        )));
+    };
+    if !principal.allows(TokenPerm::Features, feature_repositories(&feature)) {
+        return Err(Box::new(forbidden()));
+    }
+    Ok(feature)
+}
+
+fn review_result<T: Serialize>(result: Result<T, LoomError>, created: bool) -> Response {
+    match result {
+        Ok(value) if created => (StatusCode::CREATED, Json(value)).into_response(),
+        Ok(value) => Json(value).into_response(),
+        Err(LoomError::UnknownRevision { repository, .. }) if repository == "reviews" => {
+            feature_error(StatusCode::NOT_FOUND, "review.not_found")
+        }
+        Err(LoomError::UnknownRevision { repository, .. }) if repository == "findings" => {
+            feature_error(StatusCode::NOT_FOUND, "review.finding_not_found")
+        }
+        Err(LoomError::UnknownRevision { repository, .. }) if repository == "comments" => {
+            feature_error(StatusCode::NOT_FOUND, "review.comment_not_found")
+        }
+        Err(LoomError::UnknownRevision { .. }) => {
+            feature_error(StatusCode::NOT_FOUND, "feature.not_found")
+        }
+        Err(LoomError::ResourceLimit) => {
+            feature_error(StatusCode::PAYLOAD_TOO_LARGE, "review.too_large")
+        }
+        Err(LoomError::StorageUnavailable) => {
+            feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable")
+        }
+        Err(LoomError::DuplicateSourceMutation { .. } | LoomError::InvalidPath { .. }) => {
+            feature_error(StatusCode::UNPROCESSABLE_ENTITY, "review.invalid")
+        }
+        Err(_) => feature_error(StatusCode::CONFLICT, "review.conflict"),
+    }
+}
+
+async fn create_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ReviewStart>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    match state.reviews.start_or_get(&id, request) {
+        Ok((review, created)) => review_result(Ok(review), created),
+        Err(error) => review_result::<crate::review::Review>(Err(error), false),
+    }
+}
+
+async fn list_reviews(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    review_result(state.reviews.list_for_feature(&id), false)
+}
+
+async fn append_findings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, rid)): AxumPath<(String, String)>,
+    Json(request): Json<FindingsAppend>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    match state.reviews.append_findings(&id, &rid, request) {
+        Ok(review) => Json(review).into_response(),
+        Err(LoomError::InvalidSourceCommit | LoomError::InvalidPath { .. }) => {
+            feature_error(StatusCode::UNPROCESSABLE_ENTITY, "review.invalid")
+        }
+        Err(error) => review_result::<crate::review::Review>(Err(error), false),
+    }
+}
+
+async fn complete_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, rid)): AxumPath<(String, String)>,
+    Json(request): Json<ReviewComplete>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    review_result(state.reviews.complete(&id, &rid, request), false)
+}
+
+async fn approve_finding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, fid)): AxumPath<(String, String)>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    review_result(state.reviews.approve_finding(&id, &fid), false)
+}
+
+async fn apply_finding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, fid)): AxumPath<(String, String)>,
+    Json(request): Json<FindingApply>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    review_result(state.reviews.apply_finding(&id, &fid, request), false)
+}
+
+async fn list_comments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    review_result(state.reviews.list_comments(&id), false)
+}
+
+async fn create_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<CommentCreate>,
+) -> Response {
+    if let Err(response) = require_feature_access(&state, &headers, &id) {
+        return *response;
+    }
+    match state.reviews.add_comment(&id, request) {
+        Ok(comment) => (StatusCode::CREATED, Json(comment)).into_response(),
+        Err(LoomError::InvalidSourceCommit) => {
+            feature_error(StatusCode::UNPROCESSABLE_ENTITY, "review.invalid")
+        }
+        Err(error) => review_result::<crate::review::Comment>(Err(error), false),
+    }
+}
+
 #[derive(Serialize)]
 struct AcceptedFeature {
     feature: Feature,
     read_back: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    since: Option<String>,
+    follow: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct EventsPage {
+    events: Vec<Event>,
+    cursor: String,
+}
+
+async fn list_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    if !principal.allows(TokenPerm::Events, std::iter::empty::<&str>()) {
+        return forbidden();
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CATCH_UP)
+        .clamp(1, MAX_CATCH_UP);
+    let follow = wants_follow(&query, &headers);
+    let rx = state.events.subscribe();
+    let Ok(scanned) = state.events.since(query.since.as_deref(), limit) else {
+        return feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable");
+    };
+    // The cursor tracks the last *scanned* event, not the last visible one:
+    // a page of events all filtered out for this principal must still advance
+    // the cursor, or the caller polls the same invisible window forever.
+    let cursor = scanned
+        .last()
+        .map(|event| event.id.clone())
+        .or_else(|| query.since.clone())
+        .unwrap_or_default();
+    let catch_up = scanned
+        .into_iter()
+        .filter(|event| event_visible(&principal, event))
+        .collect::<Vec<_>>();
+    if !follow {
+        return Json(EventsPage {
+            events: catch_up,
+            cursor,
+        })
+        .into_response();
+    }
+    let seen = catch_up
+        .iter()
+        .map(|event| event.id.clone())
+        .collect::<BTreeSet<_>>();
+    let catch_up_stream = stream::iter(catch_up.into_iter().filter_map(|event| sse_data(&event)));
+    let live_stream = stream::unfold(
+        (rx, seen, principal),
+        |(mut rx, mut seen, principal)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if seen.insert(event.id.clone()) && event_visible(&principal, &event) {
+                            return sse_data(&event).map(|item| (item, (rx, seen, principal)));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+    Sse::new(catch_up_stream.chain(live_stream))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn wants_follow(query: &EventsQuery, headers: &HeaderMap) -> bool {
+    let follow = query
+        .follow
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes"));
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    follow || accept
+}
+
+fn event_visible(principal: &Principal, event: &Event) -> bool {
+    principal.allows(TokenPerm::Events, event.repos.iter().map(String::as_str))
+}
+
+fn sse_data(event: &Event) -> Option<Result<SseEvent, std::convert::Infallible>> {
+    serde_json::to_string(event)
+        .ok()
+        .map(|data| Ok(SseEvent::default().data(data)))
+}
+
+fn emit_feature(events: &EventLog, kind: &str, feature: &Feature) {
+    emit_json(
+        events,
+        kind,
+        feature_repositories(feature).map(str::to_owned),
+        serde_json::json!({
+            "id": feature.id,
+            "title": feature.title,
+            "gate": feature.gate,
+            "candidate_id": feature.candidate.as_ref().map(|candidate| &candidate.id),
+        }),
+    );
+}
+
+fn emit_json(
+    events: &EventLog,
+    kind: &str,
+    repos: impl IntoIterator<Item = impl Into<String>>,
+    payload: serde_json::Value,
+) {
+    if let Err(error) = events.emit(kind, repos, payload) {
+        eprintln!("loom: event emit failed ({kind}): {error}");
+    }
 }
 
 fn feature_error(status: StatusCode, code: &str) -> Response {

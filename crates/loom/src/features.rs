@@ -50,6 +50,9 @@ pub struct EvidencePolicy {
     pub require_automated_tests: bool,
     /// Promotion must retain an exact reverse compare-and-swap.
     pub require_rollback_proof: bool,
+    /// When true, accept requires an approved review verdict.
+    #[serde(default)]
+    pub review_blocking: bool,
 }
 
 impl EvidencePolicy {
@@ -59,6 +62,7 @@ impl EvidencePolicy {
         Self {
             require_automated_tests: true,
             require_rollback_proof: true,
+            review_blocking: false,
         }
     }
 }
@@ -87,6 +91,9 @@ pub struct Candidate {
     pub repositories: Vec<RepositoryBinding>,
     /// CI evidence required by the feature policy.
     pub evidence: EvidenceBundle,
+    /// Digest-cached insights pre-flight, when the stage has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insights: Option<crate::insights::InsightsRef>, // insights-slice
 }
 
 /// Owner-approved execution contract that replaces a pull request.
@@ -232,10 +239,11 @@ impl FeatureStore {
     ///
     /// # Errors
     ///
-    /// Returns unless the feature is approved and has no candidate.
+    /// Returns unless the feature is approved. An existing candidate is
+    /// replaced wholesale so CI can re-run after review patches.
     pub fn attach_candidate(&self, id: &str, candidate: Candidate) -> Result<Feature, LoomError> {
         self.transition(id, |feature| {
-            if feature.gate != FeatureGate::Approved || feature.candidate.is_some() {
+            if feature.gate != FeatureGate::Approved {
                 return Err(LoomError::InvalidSourceCommit);
             }
             feature.repositories.clone_from(&candidate.repositories);
@@ -250,6 +258,13 @@ impl FeatureStore {
     ///
     /// Returns unless a passing candidate is attached.
     pub fn accept(&self, id: &str, rollback: Vec<RefCasUpdate>) -> Result<Feature, LoomError> {
+        let preview = self.get(id)?;
+        // review-slice
+        if preview.evidence_policy.review_blocking
+            && !crate::review::ReviewStore::new(self.store.clone()).blocking_ok(id)
+        {
+            return Err(LoomError::InvalidSourceCommit);
+        }
         self.transition(id, |feature| {
             let Some(candidate) = feature.candidate.as_ref() else {
                 return Err(LoomError::InvalidSourceCommit);
@@ -259,6 +274,45 @@ impl FeatureStore {
             }
             feature.gate = FeatureGate::Accepted;
             feature.rollback = Some(rollback);
+            Ok(())
+        })
+    }
+
+    // review-slice
+    /// Updates the candidate head for one repository after a review apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns unless the feature has a candidate binding for `repository`.
+    pub fn update_candidate_head(
+        &self,
+        id: &str,
+        repository: &str,
+        head: RepositoryRevision,
+    ) -> Result<Feature, LoomError> {
+        if head.repository != repository || head.validate().is_err() {
+            return Err(LoomError::InvalidSourceCommit);
+        }
+        self.transition(id, |feature| {
+            if feature.gate != FeatureGate::Approved {
+                return Err(LoomError::InvalidSourceCommit);
+            }
+            let Some(candidate) = feature.candidate.as_mut() else {
+                return Err(LoomError::InvalidSourceCommit);
+            };
+            let Some(binding) = candidate
+                .repositories
+                .iter_mut()
+                .find(|binding| binding.base.repository == repository)
+            else {
+                return Err(LoomError::InvalidSourceCommit);
+            };
+            binding.head = Some(head);
+            // The evidence bundle was produced for the previous head. Fail
+            // closed: Gate 2 stays blocked until CI re-runs on the new head.
+            candidate.evidence.tests_passed = false;
+            "review.patch_applied: ci evidence stale".clone_into(&mut candidate.evidence.log);
+            feature.repositories.clone_from(&candidate.repositories);
             Ok(())
         })
     }

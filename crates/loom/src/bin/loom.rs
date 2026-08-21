@@ -89,6 +89,10 @@ struct Cli {
     /// Wall-clock timeout in seconds for apply helpers.
     #[arg(long, env = "ORIGIN_APPLY_TIMEOUT_SECS")]
     origin_apply_timeout_secs: Option<u64>,
+    /// HTTPS URL template or host for outbound Origin mirror push.
+    /// `{owner}` / `{repo}` are substituted; a bare host uses `https://{host}/{owner}/{repo}.git`.
+    #[arg(long, env = "ORIGIN_MIRROR_REMOTE")]
+    origin_mirror_remote: Option<String>,
 }
 
 #[tokio::main]
@@ -185,6 +189,9 @@ fn origin_config(cli: &Cli) -> Result<OriginConfig, Box<dyn std::error::Error>> 
     }
     if let Some(seconds) = cli.origin_apply_timeout_secs {
         origin.apply_timeout = Duration::from_secs(seconds);
+    }
+    if let Some(remote) = non_empty(cli.origin_mirror_remote.as_ref()) {
+        origin.mirror_remote = Some(remote.clone());
     }
     Ok(origin)
 }

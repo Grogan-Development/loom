@@ -933,6 +933,7 @@ dependencies = [
  "base64ct",
  "clap",
  "ed25519-dalek",
+ "futures-util",
  "http-body-util",
  "reqwest",
  "serde",
@@ -946,6 +947,17 @@ dependencies = [
  "toml",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "loom-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

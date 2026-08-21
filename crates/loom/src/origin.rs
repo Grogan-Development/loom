@@ -1,4 +1,7 @@
-//! Origin SHA CI, evidence lookup, fail-closed deploy, and check-run upsert.
+//! Origin is a dumb outbound push mirror plus the historical SHA release store.
+//!
+//! Deploy is keyed to Loom evidence (`record_loom_release`), not Origin CI.
+//! Webhooks are verified (when keys are configured) and then ignored.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -7,15 +10,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
-use ed25519_dalek::pkcs8::DecodePrivateKey as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use crate::ci::{CiStatus, execute_command, load_pipeline, truncate_log};
+use crate::ci::{CiStatus, truncate_log};
+use crate::contracts::RepositoryRevision;
 use crate::deploy::apply_release;
 use crate::{LoomError, PersistentLoomStore, hex_digest, read_bounded, write_atomic};
 
@@ -26,13 +27,14 @@ const DEFAULT_OWNER: &str = "grogan-dev";
 const DEFAULT_CLONE_HOST: &str = "origin.cursor.com";
 const DEFAULT_API_BASE: &str = "https://api.cursor.com/v1/origin";
 const WEBHOOK_SKEW_SECS: u64 = 300;
+const PROTECTED_MAIN: &str = "refs/main";
 
-/// How Origin SHA trees are obtained and tested.
+/// How Origin SHA trees used to be obtained and tested. Kept for config compat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginCiRunner {
-    /// Clone from Origin git over HTTPS and run `loom-ci.toml`.
+    /// Clone from Origin git over HTTPS and run `loom-ci.toml`. Unused (mirror-only).
     Git,
-    /// Record a predetermined result. Used by tests.
+    /// Record a predetermined result. Used by leftover manual-record tests.
     Fixed {
         /// Whether required tests passed.
         passed: bool,
@@ -41,7 +43,21 @@ pub enum OriginCiRunner {
     },
 }
 
-/// Runtime configuration for Origin clone, checks, webhook verify, and apply.
+/// How outbound Origin mirror pushes are executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginMirrorRunner {
+    /// `git push` the projected SHA to the Origin remote.
+    Git,
+    /// Record a predetermined result. Used by tests; never talks to the network.
+    Fixed {
+        /// Whether the mirror push is treated as successful.
+        ok: bool,
+        /// Captured log.
+        log: String,
+    },
+}
+
+/// Runtime configuration for Origin mirror push, webhook verify, and apply.
 #[derive(Clone)]
 pub struct OriginConfig {
     /// Origin owner slug (`grogan-dev`).
@@ -50,7 +66,7 @@ pub struct OriginConfig {
     pub clone_host: String,
     /// Origin REST base including `/v1/origin`.
     pub api_base: String,
-    /// HTTPS clone token. Installation tokens are minted when this is empty.
+    /// HTTPS clone/push token. Installation tokens are unused for mirror push.
     pub clone_token: Option<String>,
     /// Origin App id used as JWT `iss` / `kid`.
     pub app_id: Option<String>,
@@ -76,12 +92,16 @@ pub struct OriginConfig {
     pub deploy_ssh_key: Option<PathBuf>,
     /// Wall-clock timeout for apply helpers.
     pub apply_timeout: Duration,
-    /// Injected webhook verifying keys. Empty means fetch Origin JWKS.
+    /// Injected webhook verifying keys. Empty means skip webhook verification.
     pub webhook_keys: Vec<[u8; 32]>,
-    /// CI runner.
+    /// Legacy CI runner (manual `POST /v1/releases/{repo}/ci` no longer runs it).
     pub ci_runner: OriginCiRunner,
     /// Skip host apply scripts after evidence checks (tests).
     pub apply_runner_noop: bool,
+    /// HTTPS URL template or host for outbound mirror push (`ORIGIN_MIRROR_REMOTE`).
+    pub mirror_remote: Option<String>,
+    /// Mirror push runner.
+    pub mirror_runner: OriginMirrorRunner,
 }
 
 impl std::fmt::Debug for OriginConfig {
@@ -98,6 +118,8 @@ impl std::fmt::Debug for OriginConfig {
             .field("workdir", &self.workdir)
             .field("ci_runner", &self.ci_runner)
             .field("apply_runner_noop", &self.apply_runner_noop)
+            .field("mirror_remote", &self.mirror_remote)
+            .field("mirror_runner", &self.mirror_runner)
             .finish_non_exhaustive()
     }
 }
@@ -126,6 +148,8 @@ impl OriginConfig {
             webhook_keys: Vec::new(),
             ci_runner: OriginCiRunner::Git,
             apply_runner_noop: false,
+            mirror_remote: None,
+            mirror_runner: OriginMirrorRunner::Git,
         }
     }
 
@@ -155,11 +179,16 @@ impl OriginConfig {
                 log: "origin.test".to_owned(),
             },
             apply_runner_noop: true,
+            mirror_remote: None,
+            mirror_runner: OriginMirrorRunner::Fixed {
+                ok: true,
+                log: "origin.mirror.test".to_owned(),
+            },
         }
     }
 }
 
-/// Durable Origin SHA job and deploy evidence.
+/// Durable SHA-keyed release used by fail-closed deploy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OriginRelease {
@@ -167,15 +196,15 @@ pub struct OriginRelease {
     pub repository: String,
     /// Git object id.
     pub git_oid: String,
-    /// Durable CI job id.
+    /// Durable CI/evidence job id.
     pub job_id: String,
-    /// CI status.
+    /// Evidence status (Passed when Loom tests passed).
     pub status: CiStatus,
     /// True only when required tests passed for this exact SHA.
     pub tests_passed: bool,
     /// Truncated command log.
     pub log: String,
-    /// Origin check-run id when upsert succeeded.
+    /// Origin check-run id when upsert succeeded (historical).
     pub origin_check_id: Option<String>,
     /// SHA last applied to the host, when deploy succeeded.
     pub deployed_oid: Option<String>,
@@ -188,7 +217,50 @@ struct PersistedReleases {
     releases: Vec<OriginRelease>,
 }
 
-/// SHA-keyed Origin CI and deploy gate.
+/// Status of one outbound Origin mirror job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginMirrorStatus {
+    /// Queued, not yet processed.
+    Pending,
+    /// Push recorded as successful.
+    Ok,
+    /// Push skipped or failed.
+    Error,
+}
+
+/// Best-effort Origin mirror job persisted in `mirror_queue.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginMirrorJob {
+    /// Durable job id.
+    pub id: String,
+    /// Allowlisted repository name.
+    pub repository: String,
+    /// Git object id when a mapping exists.
+    pub git_oid: Option<String>,
+    /// Job outcome.
+    pub status: OriginMirrorStatus,
+    /// Truncated runner log or error.
+    pub log: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedMirrors {
+    schema_version: String,
+    jobs: Vec<OriginMirrorJob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitRevisionMapping {
+    schema_version: String,
+    repository: String,
+    git_oid: String,
+    revision: RepositoryRevision,
+}
+
+/// SHA-keyed release store plus outbound Origin mirror queue.
 #[derive(Clone)]
 pub struct OriginEngine {
     store: PersistentLoomStore,
@@ -211,6 +283,18 @@ impl OriginEngine {
     #[must_use]
     pub const fn config(&self) -> &OriginConfig {
         &self.config
+    }
+
+    /// True when `repository` is a deployable/mirror allowlisted name.
+    #[must_use]
+    pub fn is_allowlisted(repository: &str) -> bool {
+        ALLOWED_REPOS.contains(&repository)
+    }
+
+    /// True when accepting this protected ref should mint a release and mirror.
+    #[must_use]
+    pub fn is_main_promotion(ref_name: &str) -> bool {
+        ref_name == PROTECTED_MAIN
     }
 
     /// Reads one SHA-keyed release.
@@ -238,46 +322,131 @@ impl OriginEngine {
         self.upsert(release)
     }
 
-    /// Clones the SHA (or uses the test runner), executes `loom-ci.toml`, and stores evidence.
+    /// Upserts a release from Loom candidate evidence (not Origin CI).
     ///
     /// # Errors
     ///
-    /// Returns for an unknown repository, invalid SHA, git failure, or storage failure.
-    pub fn run_ci(&self, repository: &str, oid: &str) -> Result<OriginRelease, LoomError> {
+    /// Returns for an unknown repository, invalid SHA, or storage failure.
+    pub fn record_loom_release(
+        &self,
+        repository: &str,
+        git_oid: &str,
+        tests_passed: bool,
+    ) -> Result<OriginRelease, LoomError> {
         allowlisted(repository)?;
-        validate_oid(oid)?;
-        if let Some(existing) = self.release(repository, oid)?
-            && existing.status == CiStatus::Passed
-        {
-            return Ok(existing);
-        }
-        let previous = self.release(repository, oid)?;
-        let mut release = OriginRelease {
+        validate_oid(git_oid)?;
+        let previous = self.release(repository, git_oid)?;
+        let release = OriginRelease {
             repository: repository.to_owned(),
-            git_oid: oid.to_owned(),
-            job_id: Uuid::now_v7().to_string(),
-            status: CiStatus::Running,
-            tests_passed: false,
-            log: String::new(),
-            origin_check_id: None,
+            git_oid: git_oid.to_owned(),
+            job_id: previous
+                .as_ref()
+                .map_or_else(|| Uuid::now_v7().to_string(), |item| item.job_id.clone()),
+            status: if tests_passed {
+                CiStatus::Passed
+            } else {
+                CiStatus::Failed
+            },
+            tests_passed,
+            log: previous
+                .as_ref()
+                .map(|item| item.log.clone())
+                .filter(|log| !log.is_empty())
+                .unwrap_or_else(|| "loom.evidence".to_owned()),
+            origin_check_id: previous
+                .as_ref()
+                .and_then(|item| item.origin_check_id.clone()),
             deployed_oid: previous.and_then(|item| item.deployed_oid),
         };
-        self.upsert(release.clone())?;
-        let (passed, log) = match &self.config.ci_runner {
-            OriginCiRunner::Fixed { passed, log } => (*passed, log.clone()),
-            OriginCiRunner::Git => match self.run_git_ci(repository, oid) {
-                Ok(result) => result,
-                Err(error) => (false, error.to_string()),
-            },
-        };
-        release.log = truncate_log(&log);
-        release.tests_passed = passed;
-        release.status = if passed {
-            CiStatus::Passed
-        } else {
-            CiStatus::Failed
-        };
         self.upsert(release)
+    }
+
+    /// Manual "record evidence" path. Does not clone from Origin or run CI.
+    ///
+    /// # Errors
+    ///
+    /// Returns for an unknown repository, invalid SHA, or storage failure.
+    pub fn run_ci(&self, repository: &str, oid: &str) -> Result<OriginRelease, LoomError> {
+        let mut release = self.record_loom_release(repository, oid, true)?;
+        if release.log == "loom.evidence" {
+            "origin.mirror_only".clone_into(&mut release.log);
+            release = self.upsert(release)?;
+        }
+        Ok(release)
+    }
+
+    /// Enqueues a best-effort Origin mirror push and processes it inline.
+    ///
+    /// Missing `git_oid` skips the push and records `error: "no git mapping"`.
+    /// Network is never used when `mirror_runner` is [`OriginMirrorRunner::Fixed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns for an unknown repository, invalid SHA, or storage failure.
+    pub fn queue_mirror(
+        &self,
+        repository: &str,
+        git_oid: Option<&str>,
+    ) -> Result<OriginMirrorJob, LoomError> {
+        allowlisted(repository)?;
+        let oid = git_oid
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if let Some(value) = oid.as_deref() {
+            validate_oid(value)?;
+        }
+        let mut job = OriginMirrorJob {
+            id: Uuid::now_v7().to_string(),
+            repository: repository.to_owned(),
+            git_oid: oid,
+            status: OriginMirrorStatus::Pending,
+            log: String::new(),
+        };
+        self.upsert_mirror(&job)?;
+        self.process_mirror(&mut job);
+        self.upsert_mirror(&job)?;
+        Ok(job)
+    }
+
+    /// Lists persisted mirror jobs (oldest first).
+    ///
+    /// # Errors
+    ///
+    /// Returns for lock or durable I/O failure.
+    pub fn mirrors(&self) -> Result<Vec<OriginMirrorJob>, LoomError> {
+        let lock = self.store.shared_lock()?;
+        let jobs = self.load_mirrors()?;
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(jobs)
+    }
+
+    /// Resolves a Loom revision to a git OID via `git-mappings/`, if present.
+    #[must_use]
+    pub fn git_oid_for_revision(
+        &self,
+        repository: &str,
+        revision: &RepositoryRevision,
+    ) -> Option<String> {
+        let directory = self.store.root.join("git-mappings").join(repository);
+        let entries = std::fs::read_dir(directory).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(bytes) = read_bounded(&path, 4096) else {
+                continue;
+            };
+            let Ok(mapping) = serde_json::from_slice::<GitRevisionMapping>(&bytes) else {
+                continue;
+            };
+            if mapping.schema_version == "v1"
+                && mapping.repository == repository
+                && mapping.revision == *revision
+                && validate_oid(&mapping.git_oid).is_ok()
+            {
+                return Some(mapping.git_oid);
+            }
+        }
+        None
     }
 
     /// Fail-closed deploy: requires `tests_passed` for this exact SHA, then apply.
@@ -354,6 +523,7 @@ impl OriginEngine {
     }
 
     /// Extracts allowlisted CI targets from a verified Origin webhook body.
+    /// Historical parser retained for tests; the webhook handler no longer runs CI.
     #[must_use]
     pub fn targets_from_webhook(body: &[u8]) -> Vec<(String, String)> {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -373,90 +543,51 @@ impl OriginEngine {
         extract_targets(&event_type, &payload)
     }
 
-    /// Best-effort Origin check-run upsert. Missing App credentials no-op.
-    pub async fn publish_check(&self, release: &OriginRelease) {
-        if self.config.app_id.is_none()
-            || self.config.app_private_key_pem.is_none()
-            || self.config.installation_id.is_none()
-        {
-            eprintln!(
-                "loom: origin check upsert skipped for {}@{} (Origin App unset)",
-                release.repository, release.git_oid
-            );
+    fn process_mirror(&self, job: &mut OriginMirrorJob) {
+        let Some(oid) = job.git_oid.as_deref() else {
+            job.status = OriginMirrorStatus::Error;
+            "no git mapping".clone_into(&mut job.log);
             return;
-        }
-        match self.upsert_check(release).await {
-            Ok(check_id) => {
-                if check_id.is_some() && check_id != release.origin_check_id {
-                    let mut updated = release.clone();
-                    updated.origin_check_id = check_id;
-                    if let Err(error) = self.upsert(updated) {
-                        eprintln!(
-                            "loom: origin check id store failed for {}@{}: {error}",
-                            release.repository, release.git_oid
-                        );
-                    }
+        };
+        match &self.config.mirror_runner {
+            OriginMirrorRunner::Fixed { ok, log } => {
+                job.status = if *ok {
+                    OriginMirrorStatus::Ok
+                } else {
+                    OriginMirrorStatus::Error
+                };
+                job.log = truncate_log(log);
+            }
+            OriginMirrorRunner::Git => match self.push_mirror(&job.repository, oid) {
+                Ok(log) => {
+                    job.status = OriginMirrorStatus::Ok;
+                    job.log = truncate_log(&log);
                 }
-            }
-            Err(error) => eprintln!(
-                "loom: origin check upsert failed for {}@{}: {error}",
-                release.repository, release.git_oid
-            ),
+                Err(error) => {
+                    job.status = OriginMirrorStatus::Error;
+                    job.log = truncate_log(&error.to_string());
+                }
+            },
         }
     }
 
-    fn run_git_ci(&self, repository: &str, oid: &str) -> Result<(bool, String), LoomError> {
-        let checkout = self.checkout(repository, oid)?;
-        let (commands, timeout) = load_pipeline(&checkout);
-        let mut log = String::new();
-        let mut passed = true;
-        for command in commands {
-            let (ok, output) = execute_command(&checkout, &command, timeout)?;
-            log.push_str("$ ");
-            log.push_str(&command.join(" "));
-            log.push('\n');
-            log.push_str(&output);
-            log.push('\n');
-            if !ok {
-                passed = false;
-                break;
-            }
+    fn push_mirror(&self, repository: &str, oid: &str) -> Result<String, LoomError> {
+        let bare = self
+            .store
+            .root
+            .join("git")
+            .join(format!("{repository}.git"));
+        if !bare.is_dir() {
+            return Err(LoomError::OriginUnavailable);
         }
-        Ok((passed, log))
-    }
-
-    fn checkout(&self, repository: &str, oid: &str) -> Result<PathBuf, LoomError> {
-        std::fs::create_dir_all(&self.config.workdir).map_err(|_| LoomError::OriginUnavailable)?;
-        let mirror = self.config.workdir.join(format!("{repository}.git"));
         let token = self.config.clone_token.clone().unwrap_or_default();
-        let url = git_url(&self.config, repository, &token);
-        let mirror_str = mirror.to_str().ok_or(LoomError::OriginUnavailable)?;
-        if !mirror.exists() {
-            git(
-                &self.config.git_program,
-                &["clone", "--bare", &url, mirror_str],
-                &self.config.workdir,
-            )?;
-            rewrite_remote(&self.config.git_program, &mirror, &self.config, repository)?;
-        }
-        // Fetch through the token URL, not the named remote: rewrite_remote
-        // deliberately strips credentials from the persisted remote.
+        let url = mirror_push_url(&self.config, repository, &token);
+        let spec = format!("{oid}:refs/heads/main");
         git(
             &self.config.git_program,
-            &["fetch", "--force", &url, oid],
-            &mirror,
-        )?;
-        let work = self.config.workdir.join(format!("work-{repository}-{oid}"));
-        if work.exists() {
-            let _ = std::fs::remove_dir_all(&work);
-        }
-        let work_str = work.to_str().ok_or(LoomError::OriginUnavailable)?;
-        git(
-            &self.config.git_program,
-            &["worktree", "add", "--detach", work_str, oid],
-            &mirror,
-        )?;
-        Ok(work)
+            &["push", "--force", &url, &spec],
+            &bare,
+        )
     }
 
     async fn verifying_keys(&self) -> Result<Vec<VerifyingKey>, LoomError> {
@@ -490,114 +621,6 @@ impl OriginEngine {
             .filter(|jwk| jwk.kty == "OKP" && jwk.crv == "Ed25519")
             .map(|jwk| decode_verifying_key(&jwk.x))
             .collect()
-    }
-
-    /// Upserts the Loom check on Origin and returns the check-run id.
-    ///
-    /// Verified request shape (Origin returns 400 field violations otherwise):
-    /// repo-scoped route, top-level `headSha`, a `checkSuite` with `key`,
-    /// `name`, and `externalId`, and RFC 3339 `externalUpdatedAt`.
-    async fn upsert_check(&self, release: &OriginRelease) -> Result<Option<String>, LoomError> {
-        let token = self.installation_token().await?;
-        let in_progress = matches!(release.status, CiStatus::Running | CiStatus::Pending);
-        let updated_at = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .map_err(|_| LoomError::OriginUnavailable)?;
-        let mut check_run = serde_json::json!({
-            "key": "ci",
-            "name": "Loom",
-            "status": if in_progress { "in_progress" } else { "completed" },
-            "externalId": release.job_id,
-            "externalUpdatedAt": updated_at,
-            "output": {
-                "title": "Loom CI",
-                "summary": release.log
-            }
-        });
-        if !in_progress {
-            check_run["conclusion"] = serde_json::json!(if release.tests_passed {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        let body = serde_json::json!({
-            "headSha": release.git_oid,
-            "checkSuite": {
-                "key": "loom",
-                "name": "Loom",
-                "externalId": release.job_id
-            },
-            "checkRuns": [check_run]
-        });
-        let url = format!(
-            "{}/repos/{}/{}/check-runs:batchUpsert",
-            self.config.api_base.trim_end_matches('/'),
-            self.config.owner,
-            release.repository
-        );
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| LoomError::OriginUnavailable)?;
-        if !response.status().is_success() {
-            return Err(LoomError::OriginUnavailable);
-        }
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| LoomError::OriginUnavailable)?;
-        Ok(value
-            .pointer("/checkRuns/0/id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned))
-    }
-
-    async fn installation_token(&self) -> Result<String, LoomError> {
-        let app_id = self
-            .config
-            .app_id
-            .as_deref()
-            .ok_or(LoomError::OriginUnavailable)?;
-        let pem = self
-            .config
-            .app_private_key_pem
-            .as_deref()
-            .ok_or(LoomError::OriginUnavailable)?;
-        let installation = self
-            .config
-            .installation_id
-            .as_deref()
-            .ok_or(LoomError::OriginUnavailable)?;
-        let jwt = mint_app_jwt(app_id, pem)?;
-        let url = format!(
-            "{}/app/installations/{installation}/access_tokens",
-            self.config.api_base.trim_end_matches('/')
-        );
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(jwt)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(|_| LoomError::OriginUnavailable)?;
-        if !response.status().is_success() {
-            return Err(LoomError::OriginUnavailable);
-        }
-        let body: InstallationToken = response
-            .json()
-            .await
-            .map_err(|_| LoomError::OriginUnavailable)?;
-        if body.token.is_empty() {
-            Err(LoomError::OriginUnavailable)
-        } else {
-            Ok(body.token)
-        }
     }
 
     fn upsert(&self, release: OriginRelease) -> Result<OriginRelease, LoomError> {
@@ -642,17 +665,57 @@ impl OriginEngine {
             .map(|release| (release_key(&release.repository, &release.git_oid), release))
             .collect())
     }
+
+    fn upsert_mirror(&self, job: &OriginMirrorJob) -> Result<(), LoomError> {
+        let lock = self.store.exclusive_lock()?;
+        let mut jobs = self.load_mirrors()?;
+        if let Some(existing) = jobs.iter_mut().find(|item| item.id == job.id) {
+            *existing = job.clone();
+        } else {
+            jobs.push(job.clone());
+        }
+        if jobs.len() > MAX_JOBS {
+            return Err(LoomError::ResourceLimit);
+        }
+        let persisted = PersistedMirrors {
+            schema_version: "v1".to_owned(),
+            jobs,
+        };
+        let bytes = serde_json::to_vec(&persisted).map_err(|_| LoomError::Serialization)?;
+        write_atomic(
+            &self.store.root,
+            &self.store.root.join("mirror_queue.json"),
+            &bytes,
+            0o600,
+        )?;
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(())
+    }
+
+    fn load_mirrors(&self) -> Result<Vec<OriginMirrorJob>, LoomError> {
+        let path = self.store.root.join("mirror_queue.json");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = read_bounded(&path, MAX_ORIGIN_BYTES)?;
+        let persisted: PersistedMirrors =
+            serde_json::from_slice(&bytes).map_err(|_| LoomError::CorruptState)?;
+        if persisted.schema_version != "v1" {
+            return Err(LoomError::CorruptState);
+        }
+        Ok(persisted.jobs)
+    }
 }
 
 /// Request body for `POST /v1/releases/{repo}/ci`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OriginCiRequest {
-    /// Git object id to test.
+    /// Git object id to record evidence for.
     #[serde(alias = "oid", alias = "sha")]
     pub git_oid: String,
 }
 
-/// Public evidence document consumed by Cursor Cloud CD.
+/// Public evidence document consumed by deploy.
 #[derive(Debug, Clone, Serialize)]
 pub struct OriginEvidence {
     /// CI status.
@@ -692,12 +755,6 @@ struct Jwk {
     crv: String,
     #[serde(default)]
     x: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct InstallationToken {
-    #[serde(default)]
-    token: String,
 }
 
 fn allowlisted(repository: &str) -> Result<(), LoomError> {
@@ -748,36 +805,63 @@ fn signature_bytes(header: &str) -> Option<&str> {
         })
 }
 
-fn git_url(config: &OriginConfig, repository: &str, token: &str) -> String {
-    if token.is_empty() {
+fn looks_like_host(value: &str) -> bool {
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(value);
+    !rest.is_empty() && !rest.contains('/')
+}
+
+fn inject_token(url: &str, token: &str) -> String {
+    if token.is_empty() || url.contains('@') {
+        return url.to_owned();
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        format!("https://x-access-token:{token}@{rest}")
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        format!("http://x-access-token:{token}@{rest}")
+    } else {
+        url.to_owned()
+    }
+}
+
+fn mirror_push_url(config: &OriginConfig, repository: &str, token: &str) -> String {
+    let rendered = if let Some(remote) = config
+        .mirror_remote
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let with_owner = remote.replace("{owner}", &config.owner);
+        if with_owner.contains("{repo}") || with_owner.contains("{repository}") {
+            with_owner
+                .replace("{repo}", repository)
+                .replace("{repository}", repository)
+        } else if looks_like_host(&with_owner) {
+            let host = with_owner
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/');
+            format!("https://{}/{}/{repository}.git", host, config.owner)
+        } else {
+            let trimmed = with_owner.trim_end_matches('/');
+            let has_git_suffix = std::path::Path::new(trimmed)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("git"));
+            if has_git_suffix {
+                trimmed.to_owned()
+            } else {
+                format!("{}/{}/{repository}.git", trimmed, config.owner)
+            }
+        }
+    } else {
         format!(
             "https://{}/{}/{repository}.git",
             config.clone_host, config.owner
         )
-    } else {
-        format!(
-            "https://x-access-token:{token}@{}/{}/{repository}.git",
-            config.clone_host, config.owner
-        )
-    }
-}
-
-fn rewrite_remote(
-    git_program: &Path,
-    mirror: &Path,
-    config: &OriginConfig,
-    repository: &str,
-) -> Result<(), LoomError> {
-    let clean = format!(
-        "https://{}/{}/{repository}.git",
-        config.clone_host, config.owner
-    );
-    git(
-        git_program,
-        &["remote", "set-url", "origin", &clean],
-        mirror,
-    )
-    .map(|_| ())
+    };
+    inject_token(&rendered, token)
 }
 
 fn git(program: &Path, args: &[&str], cwd: &Path) -> Result<String, LoomError> {
@@ -823,28 +907,6 @@ fn decode_verifying_key(x: &str) -> Result<VerifyingKey, LoomError> {
     let bytes = Base64UrlUnpadded::decode_vec(x).map_err(|_| LoomError::OriginUnavailable)?;
     let key_bytes: [u8; 32] = bytes.try_into().map_err(|_| LoomError::OriginUnavailable)?;
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| LoomError::OriginUnavailable)
-}
-
-fn mint_app_jwt(app_id: &str, pem: &str) -> Result<String, LoomError> {
-    let key = SigningKey::from_pkcs8_pem(pem).map_err(|_| LoomError::OriginUnavailable)?;
-    let now = unix_now();
-    let header = serde_json::json!({ "alg": "EdDSA", "kid": app_id, "typ": "JWT" });
-    let payload = serde_json::json!({
-        "iss": app_id,
-        "aud": "origin-apps",
-        "iat": now,
-        "exp": now.saturating_add(300)
-    });
-    let header_b64 = Base64UrlUnpadded::encode_string(
-        &serde_json::to_vec(&header).map_err(|_| LoomError::Serialization)?,
-    );
-    let payload_b64 = Base64UrlUnpadded::encode_string(
-        &serde_json::to_vec(&payload).map_err(|_| LoomError::Serialization)?,
-    );
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    let signature = key.sign(signing_input.as_bytes());
-    let signature_b64 = Base64UrlUnpadded::encode_string(&signature.to_bytes());
-    Ok(format!("{signing_input}.{signature_b64}"))
 }
 
 fn extract_targets(event_type: &str, payload: &serde_json::Value) -> Vec<(String, String)> {
