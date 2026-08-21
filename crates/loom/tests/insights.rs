@@ -167,6 +167,15 @@ async fn insights_get_after_candidate_submit() {
     features.approve(&feature.id).unwrap();
 
     let router = test_app(root);
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/repos",
+        OWNER,
+        serde_json::json!({ "name": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
     let (status, submitted) = send(
         &router,
         "POST",

@@ -85,6 +85,20 @@ async fn mint(
     (id, secret)
 }
 
+async fn register_repo(router: &axum::Router, name: &str) {
+    let (status, _) = send(
+        router,
+        json_request(
+            "POST",
+            "/v1/repos",
+            OWNER,
+            serde_json::json!({ "name": name }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
 fn feature_create_body(repository: &str) -> serde_json::Value {
     serde_json::json!({
         "title": "scoped feature",
@@ -170,6 +184,8 @@ async fn token_mint_requires_owner_and_validates() {
 #[tokio::test]
 async fn scoped_token_gates_features_by_repository() {
     let (_directory, router) = test_app();
+    register_repo(&router, "demo").await;
+    register_repo(&router, "other").await;
     let (_id, secret) = mint(&router, "ws-demo", &["demo"], &["features"]).await;
 
     let (status, created) = send(
@@ -280,6 +296,7 @@ async fn scoped_token_gates_evidence_and_missing_perm_is_forbidden() {
 #[tokio::test]
 async fn git_gateway_accepts_scoped_bearer_and_basic_within_scope() {
     let (_directory, router) = test_app();
+    register_repo(&router, "demo").await;
     let (_id, secret) = mint(&router, "ws-git", &["demo"], &["git"]).await;
 
     let challenge = router

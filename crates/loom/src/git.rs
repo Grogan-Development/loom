@@ -12,6 +12,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::catalog::RepoCatalog;
 use crate::contracts::RepositoryRevision;
 use crate::tokens::{Authority, TokenPerm};
 use axum::{
@@ -163,6 +164,7 @@ pub struct GitSshGateway {
 struct GitHttpState {
     bridge: GitBridge,
     authority: Authority,
+    catalog: RepoCatalog,
 }
 
 impl fmt::Debug for GitHttpGateway {
@@ -177,12 +179,17 @@ impl fmt::Debug for GitHttpGateway {
 
 impl GitHttpGateway {
     /// Creates a gateway that admits Git traffic with the owner token or a
-    /// scoped token holding the `git` perm on the requested repository.
+    /// scoped token holding the `git` perm on the requested repository, but
+    /// only for repositories registered in the durable repo catalog.
     /// Credentials arrive as Bearer or as the password of HTTP Basic.
     #[must_use]
-    pub fn new(bridge: GitBridge, authority: Authority) -> Self {
+    pub fn new(bridge: GitBridge, authority: Authority, catalog: RepoCatalog) -> Self {
         Self {
-            state: Arc::new(GitHttpState { bridge, authority }),
+            state: Arc::new(GitHttpState {
+                bridge,
+                authority,
+                catalog,
+            }),
         }
     }
 
@@ -716,6 +723,13 @@ async fn git_http_request(State(state): State<Arc<GitHttpState>>, request: Reque
     };
     if authenticate_git(&state, request.headers(), &parsed.repository).is_err() {
         return git_http_error(StatusCode::UNAUTHORIZED);
+    }
+    // Catalog gate after authentication: unknown repositories are 404, and
+    // storage failures fail closed as 503.
+    match state.catalog.get(&parsed.repository) {
+        Ok(Some(_)) => {}
+        Ok(None) => return git_http_error(StatusCode::NOT_FOUND),
+        Err(_) => return git_http_error(StatusCode::SERVICE_UNAVAILABLE),
     }
     let body = match to_bytes(request.into_body(), MAX_GIT_HTTP_BODY_BYTES).await {
         Ok(body) => body.to_vec(),

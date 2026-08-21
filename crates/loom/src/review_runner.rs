@@ -781,6 +781,9 @@ mod tests {
         store
             .create_ref(&grant, "demo", "refs/main", &base)
             .unwrap();
+        crate::catalog::RepoCatalog::open(store.clone())
+            .upsert(crate::catalog::RepoEntry::minimal("demo"))
+            .unwrap();
         let features = FeatureStore::new(store.clone());
         let created = features
             .create(FeatureCreate {

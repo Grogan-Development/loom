@@ -20,6 +20,7 @@ use futures_util::stream::{self, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AccessToken, bearer_token};
+use crate::catalog::{RepoCatalog, RepoUpsert};
 use crate::ci::CiEngine;
 use crate::events::{DEFAULT_CATCH_UP, Event, EventLog, MAX_CATCH_UP};
 use crate::features::{CandidateSubmit, Feature, FeatureCreate, FeatureStore, promotion_updates};
@@ -66,6 +67,7 @@ struct AppState {
     ci: CiEngine,
     insights: InsightsEngine, // insights-slice
     origin: OriginEngine,
+    catalog: RepoCatalog,
     store: PersistentLoomStore,
     events: EventLog, // events-slice
     review_dispatcher: Option<ReviewDispatcher>,
@@ -94,12 +96,14 @@ impl LoomApp {
         let rpc = LoomRpc::new(store.clone())
             .router()
             .layer(middleware::from_fn_with_state(token_state, require_bearer));
+        let origin = OriginEngine::new(store.clone(), config.origin);
+        let catalog = origin.catalog().clone();
+        catalog.ensure_seeded()?;
         let git_router = GitBridge::new(store.clone(), &config.git_program, &config.hook_program)
             .map_or_else(
                 |_| Router::new(),
-                |bridge| GitHttpGateway::new(bridge, authority.clone()).router(),
+                |bridge| GitHttpGateway::new(bridge, authority.clone(), catalog.clone()).router(),
             );
-        let origin = OriginEngine::new(store.clone(), config.origin);
         let events = EventLog::new(store.clone()); // events-slice
         let review_dispatcher = config.review_runner.map(|review_runner| {
             ReviewDispatcher::new(
@@ -122,6 +126,7 @@ impl LoomApp {
             ci,
             insights,
             origin,
+            catalog,
             store,
             events,
             review_dispatcher,
@@ -130,6 +135,8 @@ impl LoomApp {
             .route("/healthz", get(healthz))
             .route("/v1/tokens", get(list_tokens).post(mint_token))
             .route("/v1/tokens/{id}", delete(revoke_token))
+            .route("/v1/repos", get(list_repos).post(upsert_repo))
+            .route("/v1/repos/{name}", get(get_repo).delete(delete_repo))
             .route("/v1/events", get(list_events)) // events-slice
             .route("/v1/features", get(list_features).post(create_feature))
             .route("/v1/features/{id}", get(get_feature))
@@ -357,6 +364,9 @@ async fn origin_deploy_release(
         Ok(Err(LoomError::OriginRepositoryDenied { .. })) => {
             feature_error(StatusCode::NOT_FOUND, "origin.repository_denied")
         }
+        Ok(Err(LoomError::DeployUnconfigured { .. })) => {
+            feature_error(StatusCode::CONFLICT, "origin.deploy_unconfigured")
+        }
         Ok(Err(_)) => feature_error(StatusCode::CONFLICT, "origin.deploy_failed"),
         Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "origin.unavailable"),
     }
@@ -431,6 +441,22 @@ fn feature_repositories(feature: &Feature) -> impl Iterator<Item = &str> {
         .map(|binding| binding.base.repository.as_str())
 }
 
+/// Every repository a candidate submission touches: the feature's bindings
+/// plus the submitted bases and heads.
+fn candidate_repositories<'a>(
+    feature: &'a Feature,
+    request: &'a CandidateSubmit,
+) -> BTreeSet<&'a str> {
+    let mut touched = feature_repositories(feature).collect::<BTreeSet<_>>();
+    for binding in &request.repositories {
+        touched.insert(binding.base.repository.as_str());
+        if let Some(head) = &binding.head {
+            touched.insert(head.repository.as_str());
+        }
+    }
+    touched
+}
+
 async fn mint_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -475,6 +501,92 @@ async fn revoke_token(
     }
 }
 
+async fn list_repos(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.catalog.list() {
+        Ok(entries) => Json(entries).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
+    }
+}
+
+async fn upsert_repo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RepoUpsert>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let Ok(entry) = request.into_entry() else {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "repo.invalid");
+    };
+    match state.catalog.upsert(entry) {
+        Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
+        Err(LoomError::ResourceLimit) => {
+            feature_error(StatusCode::UNPROCESSABLE_ENTITY, "repo.invalid")
+        }
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
+    }
+}
+
+async fn get_repo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.catalog.get(&name) {
+        Ok(Some(entry)) => Json(entry).into_response(),
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "repo.unknown"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
+    }
+}
+
+async fn delete_repo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.catalog.remove(&name) {
+        Ok(removed) => Json(removed).into_response(),
+        Err(LoomError::UnknownRepo { .. }) => feature_error(StatusCode::NOT_FOUND, "repo.unknown"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
+    }
+}
+
+/// Requires every repository to be registered in the durable repo catalog.
+/// Unknown repositories read as 404; storage failures fail closed as 503.
+fn require_registered<'a>(
+    state: &AppState,
+    repositories: impl IntoIterator<Item = &'a str>,
+) -> Result<(), Box<Response>> {
+    for repository in repositories {
+        match state.catalog.get(repository) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(Box::new(feature_error(
+                    StatusCode::NOT_FOUND,
+                    "repo.unknown",
+                )));
+            }
+            Err(_) => {
+                return Err(Box::new(feature_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "loom.storage_unavailable",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn list_features(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let principal = match resolve_principal(&state, &headers) {
         Ok(principal) => principal,
@@ -515,6 +627,15 @@ async fn create_feature(
             .map(|binding| binding.base.repository.as_str()),
     ) {
         return forbidden();
+    }
+    if let Err(response) = require_registered(
+        &state,
+        request
+            .repositories
+            .iter()
+            .map(|binding| binding.base.repository.as_str()),
+    ) {
+        return *response;
     }
     match state.features.create(request) {
         Ok(feature) => {
@@ -587,15 +708,12 @@ async fn submit_candidate(
     let Ok(feature) = state.features.get(&id) else {
         return feature_error(StatusCode::NOT_FOUND, "feature.not_found");
     };
-    let mut touched = feature_repositories(&feature).collect::<BTreeSet<_>>();
-    for binding in &request.repositories {
-        touched.insert(binding.base.repository.as_str());
-        if let Some(head) = &binding.head {
-            touched.insert(head.repository.as_str());
-        }
-    }
-    if !principal.allows(TokenPerm::Features, touched) {
+    let touched = candidate_repositories(&feature, &request);
+    if !principal.allows(TokenPerm::Features, touched.iter().copied()) {
         return forbidden();
+    }
+    if let Err(response) = require_registered(&state, touched) {
+        return *response;
     }
     if feature.gate != crate::features::FeatureGate::Approved {
         return feature_error(StatusCode::CONFLICT, "feature.invalid_transition");
@@ -768,16 +886,18 @@ async fn accept_feature(
     }
 }
 
-/// origin-slice: after `refs/main` CAS for loom|nero|grid, mint a release and queue a mirror.
+/// origin-slice: after a protected-ref CAS on a registered repository, mint a
+/// release and queue a mirror. The repo catalog decides which ref is protected.
 fn record_origin_mirrors(
     origin: &OriginEngine,
     tests_passed: bool,
     updates: &[crate::RefCasUpdate],
 ) {
     for update in updates {
-        if !OriginEngine::is_main_promotion(&update.ref_name)
-            || !OriginEngine::is_allowlisted(&update.repository)
-        {
+        let Ok(Some(entry)) = origin.catalog().get(&update.repository) else {
+            continue;
+        };
+        if update.ref_name != entry.protected_ref {
             continue;
         }
         let git_oid = origin.git_oid_for_revision(&update.repository, &update.head);

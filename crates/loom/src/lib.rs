@@ -1,6 +1,7 @@
 //! Loom content-addressed source, refs, atomic promotion, features, and CI.
 
 pub mod auth;
+pub mod catalog;
 pub mod ci;
 pub mod contracts;
 pub mod deploy;
@@ -165,6 +166,18 @@ pub enum LoomError {
     /// Scoped-token mint request failed its name, repository, perm, or expiry contract.
     #[error("scoped token request is invalid")]
     InvalidToken,
+    /// Repository is not registered in the durable repo catalog.
+    #[error("repository is not registered: {repository}")]
+    UnknownRepo {
+        /// Requested repository name.
+        repository: String,
+    },
+    /// Deploy was requested for a repository whose catalog entry has no deploy target.
+    #[error("deploy target is not configured for {repository}")]
+    DeployUnconfigured {
+        /// Requested repository name.
+        repository: String,
+    },
     /// Scoped-token id does not exist in the catalog.
     #[error("unknown scoped token: {id}")]
     UnknownToken {

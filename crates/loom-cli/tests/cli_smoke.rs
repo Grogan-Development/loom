@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use loom::auth::AccessToken;
+use loom::catalog::{RepoCatalog, RepoEntry};
 use loom::origin::OriginConfig;
 use loom::server::{LoomApp, ServerConfig};
 use loom::{NamespaceGrant, PersistentLoomStore};
@@ -35,6 +36,9 @@ fn test_app() -> (tempfile::TempDir, axum::Router, String, String) {
         .unwrap();
     store
         .create_ref(&grant, "demo", "refs/main", &base)
+        .unwrap();
+    RepoCatalog::open(store.clone())
+        .upsert(RepoEntry::minimal("demo"))
         .unwrap();
     let origin = OriginConfig::for_test(directory.path().join("origin-work"), true);
     let app = LoomApp::new(ServerConfig {

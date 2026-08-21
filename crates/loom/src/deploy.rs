@@ -1,50 +1,41 @@
 //! Host apply helpers invoked only after Origin SHA evidence has passed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::LoomError;
+use crate::catalog::DeployTarget;
 use crate::origin::OriginConfig;
 
-/// Runs the allowlisted apply script for `repository` at `oid`.
+/// Runs the catalog-configured apply script for `repository` at `oid`.
 ///
-/// Loom applies locally. Grid and Nero apply over SSH to the workstation host.
+/// The seeded catalog preserves historical behavior: Loom applies locally,
+/// Grid and Nero apply over SSH to the workstation host.
 ///
 /// # Errors
 ///
-/// Returns when the repository is unknown, the apply helper is missing, SSH is
+/// Returns [`LoomError::DeployUnconfigured`] when the entry has no deploy
+/// target, and otherwise when the apply helper is missing, SSH is
 /// unconfigured, the process fails, or the helper exceeds its timeout.
 pub fn apply_release(
     config: &OriginConfig,
+    target: &DeployTarget,
     repository: &str,
     oid: &str,
 ) -> Result<String, LoomError> {
-    if config.apply_runner_noop {
-        return Ok(format!("{repository}@{oid} apply noop"));
-    }
-    let script = apply_script(config, repository)?;
-    if repository == "loom" {
-        return run_local(&script, oid, config.apply_timeout);
-    }
-    run_ssh(config, &script, oid)
-}
-
-fn apply_script(config: &OriginConfig, repository: &str) -> Result<PathBuf, LoomError> {
-    let path = match repository {
-        "loom" => config.loom_apply.clone(),
-        "grid" => config.grid_apply.clone(),
-        "nero" => config.nero_apply.clone(),
-        _ => {
-            return Err(LoomError::OriginRepositoryDenied {
-                repository: repository.to_owned(),
-            });
+    match target {
+        DeployTarget::None => Err(LoomError::DeployUnconfigured {
+            repository: repository.to_owned(),
+        }),
+        DeployTarget::LocalApply { .. } | DeployTarget::SshApply { .. }
+            if config.apply_runner_noop =>
+        {
+            Ok(format!("{repository}@{oid} apply noop"))
         }
-    };
-    if path.as_os_str().is_empty() {
-        return Err(LoomError::OriginUnavailable);
+        DeployTarget::LocalApply { script } => run_local(script, oid, config.apply_timeout),
+        DeployTarget::SshApply { host, script } => run_ssh(config, host.as_deref(), script, oid),
     }
-    Ok(path)
 }
 
 fn run_local(script: &Path, oid: &str, timeout: Duration) -> Result<String, LoomError> {
@@ -59,10 +50,14 @@ fn run_local(script: &Path, oid: &str, timeout: Duration) -> Result<String, Loom
     wait_child(&mut child, timeout)
 }
 
-fn run_ssh(config: &OriginConfig, script: &Path, oid: &str) -> Result<String, LoomError> {
-    let host = config
-        .deploy_ssh_host
-        .as_deref()
+fn run_ssh(
+    config: &OriginConfig,
+    entry_host: Option<&str>,
+    script: &Path,
+    oid: &str,
+) -> Result<String, LoomError> {
+    let host = entry_host
+        .or(config.deploy_ssh_host.as_deref())
         .filter(|value| !value.is_empty())
         .ok_or(LoomError::OriginUnavailable)?;
     let user = config

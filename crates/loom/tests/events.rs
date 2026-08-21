@@ -84,6 +84,20 @@ async fn mint(
     (id, secret)
 }
 
+async fn register_repo(router: &axum::Router, name: &str) {
+    let (status, _) = send(
+        router,
+        json_request(
+            "POST",
+            "/v1/repos",
+            OWNER,
+            serde_json::json!({ "name": name }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
 fn feature_create_body(repository: &str) -> serde_json::Value {
     serde_json::json!({
         "title": "scoped feature",
@@ -133,6 +147,8 @@ fn emit_then_since_returns_catch_up() {
 #[tokio::test]
 async fn scoped_token_without_events_is_forbidden_and_scope_filters() {
     let (_directory, router) = test_app();
+    register_repo(&router, "demo").await;
+    register_repo(&router, "other").await;
 
     let (status, _) = send(
         &router,
@@ -171,6 +187,8 @@ async fn scoped_token_without_events_is_forbidden_and_scope_filters() {
 #[tokio::test]
 async fn cursor_advances_past_a_window_of_invisible_events() {
     let (_directory, router) = test_app();
+    register_repo(&router, "demo").await;
+    register_repo(&router, "other").await;
 
     // Two "other" events the scoped token cannot see, then one "demo" event.
     for _ in 0..2 {
@@ -229,6 +247,7 @@ async fn cursor_advances_past_a_window_of_invisible_events() {
 #[tokio::test]
 async fn follow_receives_event_emitted_after_connect() {
     let (_directory, router) = test_app();
+    register_repo(&router, "demo").await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

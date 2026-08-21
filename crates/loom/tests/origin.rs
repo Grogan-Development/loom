@@ -149,10 +149,11 @@ async fn webhook_accepts_signed_payload_without_starting_ci() {
 /// (deliveryId/appId wrapper, camelCase `pullRequest.head.sha`).
 #[test]
 fn webhook_targets_parse_origin_pull_request_shape() {
+    let (_directory, origin) = test_engine(true);
     let body = format!(
         r#"{{"deliveryId":"whd_1","appId":"app_1","installationId":"i_1","event":{{"id":"evt_1","type":"pull_request.created","payload":{{"pullRequest":{{"number":"1","head":{{"ref":"scratch/x","sha":"{OID}"}},"base":{{"ref":"main","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"version":{{"headSha":"{OID}"}}}},"repository":{{"name":"loom","owner":{{"slug":"grogan-dev"}}}}}}}}}}"#
     );
-    let targets = loom::origin::OriginEngine::targets_from_webhook(body.as_bytes());
+    let targets = origin.targets_from_webhook(body.as_bytes());
     assert_eq!(targets, vec![("loom".to_owned(), OID.to_owned())]);
 }
 
@@ -160,11 +161,22 @@ fn webhook_targets_parse_origin_pull_request_shape() {
 /// Only updates to `main` are parsed; branch pushes and deletions are ignored.
 #[test]
 fn webhook_targets_parse_origin_ref_updates_shape() {
+    let (_directory, origin) = test_engine(true);
     let body = format!(
         r#"{{"deliveryId":"whd_2","appId":"app_1","installationId":"i_1","event":{{"id":"evt_2","type":"repository.pushed","payload":{{"repository":{{"name":"loom","owner":{{"slug":"grogan-dev"}}}},"refUpdates":[{{"ref":"refs/heads/scratch/x","before":"0000000000000000000000000000000000000000","after":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","created":true,"deleted":false}},{{"ref":"refs/heads/main","before":"cccccccccccccccccccccccccccccccccccccccc","after":"{OID}","created":false,"deleted":false}},{{"ref":"refs/heads/gone","after":"dddddddddddddddddddddddddddddddddddddddd","deleted":true}}]}}}}}}"#
     );
-    let targets = loom::origin::OriginEngine::targets_from_webhook(body.as_bytes());
+    let targets = origin.targets_from_webhook(body.as_bytes());
     assert_eq!(targets, vec![("loom".to_owned(), OID.to_owned())]);
+}
+
+/// Webhook targets for repositories outside the catalog are dropped.
+#[test]
+fn webhook_targets_drop_unregistered_repositories() {
+    let (_directory, origin) = test_engine(true);
+    let body = format!(
+        r#"{{"event":{{"type":"pull_request.created","payload":{{"repository":{{"name":"secret"}},"pullRequest":{{"headSha":"{OID}"}}}}}}}}"#
+    );
+    assert!(origin.targets_from_webhook(body.as_bytes()).is_empty());
 }
 
 #[tokio::test]

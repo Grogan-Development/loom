@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+use crate::catalog::{RepoCatalog, RepoEntry, seed_entries};
 use crate::ci::{CiStatus, truncate_log};
 use crate::contracts::RepositoryRevision;
 use crate::deploy::apply_release;
@@ -22,12 +23,10 @@ use crate::{LoomError, PersistentLoomStore, hex_digest, read_bounded, write_atom
 
 const MAX_ORIGIN_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_JOBS: usize = 10_000;
-const ALLOWED_REPOS: [&str; 3] = ["loom", "nero", "grid"];
 const DEFAULT_OWNER: &str = "grogan-dev";
 const DEFAULT_CLONE_HOST: &str = "origin.cursor.com";
 const DEFAULT_API_BASE: &str = "https://api.cursor.com/v1/origin";
 const WEBHOOK_SKEW_SECS: u64 = 300;
-const PROTECTED_MAIN: &str = "refs/main";
 
 /// How Origin SHA trees used to be obtained and tested. Kept for config compat.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +191,7 @@ impl OriginConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OriginRelease {
-    /// Allowlisted repository name.
+    /// Registered repository name.
     pub repository: String,
     /// Git object id.
     pub git_oid: String,
@@ -235,7 +234,7 @@ pub enum OriginMirrorStatus {
 pub struct OriginMirrorJob {
     /// Durable job id.
     pub id: String,
-    /// Allowlisted repository name.
+    /// Registered repository name.
     pub repository: String,
     /// Git object id when a mapping exists.
     pub git_oid: Option<String>,
@@ -265,16 +264,20 @@ struct GitRevisionMapping {
 pub struct OriginEngine {
     store: PersistentLoomStore,
     config: OriginConfig,
+    catalog: RepoCatalog,
     http: reqwest::Client,
 }
 
 impl OriginEngine {
-    /// Creates an Origin engine over an existing Loom dataset.
+    /// Creates an Origin engine over an existing Loom dataset. The repo
+    /// catalog defaults to the seeded entries until `repos.json` is written.
     #[must_use]
     pub fn new(store: PersistentLoomStore, config: OriginConfig) -> Self {
+        let catalog = RepoCatalog::with_defaults(store.clone(), seed_entries(&config));
         Self {
             store,
             config,
+            catalog,
             http: reqwest::Client::new(),
         }
     }
@@ -285,16 +288,24 @@ impl OriginEngine {
         &self.config
     }
 
-    /// True when `repository` is a deployable/mirror allowlisted name.
+    /// Durable repo catalog gating releases, mirrors, and deploys.
     #[must_use]
-    pub fn is_allowlisted(repository: &str) -> bool {
-        ALLOWED_REPOS.contains(&repository)
+    pub const fn catalog(&self) -> &RepoCatalog {
+        &self.catalog
     }
 
-    /// True when accepting this protected ref should mint a release and mirror.
-    #[must_use]
-    pub fn is_main_promotion(ref_name: &str) -> bool {
-        ref_name == PROTECTED_MAIN
+    /// Resolves a registered catalog entry, failing closed on storage errors.
+    fn registered(&self, repository: &str) -> Result<RepoEntry, LoomError> {
+        self.catalog
+            .get(repository)?
+            .ok_or_else(|| LoomError::OriginRepositoryDenied {
+                repository: repository.to_owned(),
+            })
+    }
+
+    /// True when the repository is registered. Storage failures read as false.
+    fn is_registered(&self, repository: &str) -> bool {
+        matches!(self.catalog.get(repository), Ok(Some(_)))
     }
 
     /// Reads one SHA-keyed release.
@@ -303,7 +314,7 @@ impl OriginEngine {
     ///
     /// Returns for lock or durable I/O failure.
     pub fn release(&self, repository: &str, oid: &str) -> Result<Option<OriginRelease>, LoomError> {
-        allowlisted(repository)?;
+        self.registered(repository)?;
         validate_oid(oid)?;
         let lock = self.store.shared_lock()?;
         let releases = self.load()?;
@@ -317,7 +328,7 @@ impl OriginEngine {
     ///
     /// Returns for lock, serialization, or durable I/O failure.
     pub fn put_release(&self, release: OriginRelease) -> Result<OriginRelease, LoomError> {
-        allowlisted(&release.repository)?;
+        self.registered(&release.repository)?;
         validate_oid(&release.git_oid)?;
         self.upsert(release)
     }
@@ -333,7 +344,7 @@ impl OriginEngine {
         git_oid: &str,
         tests_passed: bool,
     ) -> Result<OriginRelease, LoomError> {
-        allowlisted(repository)?;
+        self.registered(repository)?;
         validate_oid(git_oid)?;
         let previous = self.release(repository, git_oid)?;
         let release = OriginRelease {
@@ -388,7 +399,7 @@ impl OriginEngine {
         repository: &str,
         git_oid: Option<&str>,
     ) -> Result<OriginMirrorJob, LoomError> {
-        allowlisted(repository)?;
+        self.registered(repository)?;
         let oid = git_oid
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -449,13 +460,16 @@ impl OriginEngine {
         None
     }
 
-    /// Fail-closed deploy: requires `tests_passed` for this exact SHA, then apply.
+    /// Fail-closed deploy: requires `tests_passed` for this exact SHA, then
+    /// applies through the catalog entry's deploy target.
     ///
     /// # Errors
     ///
-    /// Returns [`LoomError::OriginDeployBlocked`] when evidence is missing or failed.
+    /// Returns [`LoomError::OriginDeployBlocked`] when evidence is missing or
+    /// failed, and [`LoomError::DeployUnconfigured`] when the catalog entry
+    /// has no deploy target.
     pub fn deploy(&self, repository: &str, oid: &str) -> Result<OriginRelease, LoomError> {
-        allowlisted(repository)?;
+        let entry = self.registered(repository)?;
         validate_oid(oid)?;
         let Some(mut release) = self.release(repository, oid)? else {
             return Err(LoomError::OriginDeployBlocked {
@@ -472,7 +486,7 @@ impl OriginEngine {
         if release.deployed_oid.as_deref() == Some(oid) {
             return Ok(release);
         }
-        let log = apply_release(&self.config, repository, oid)?;
+        let log = apply_release(&self.config, &entry.deploy_target, repository, oid)?;
         release.log = truncate_log(&format!("{}\n{log}", release.log));
         release.deployed_oid = Some(oid.to_owned());
         self.upsert(release)
@@ -522,10 +536,10 @@ impl OriginEngine {
         }
     }
 
-    /// Extracts allowlisted CI targets from a verified Origin webhook body.
+    /// Extracts registered CI targets from a verified Origin webhook body.
     /// Historical parser retained for tests; the webhook handler no longer runs CI.
     #[must_use]
-    pub fn targets_from_webhook(body: &[u8]) -> Vec<(String, String)> {
+    pub fn targets_from_webhook(&self, body: &[u8]) -> Vec<(String, String)> {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
             return Vec::new();
         };
@@ -541,6 +555,9 @@ impl OriginEngine {
             .or_else(|| value.get("payload").cloned())
             .unwrap_or(value);
         extract_targets(&event_type, &payload)
+            .into_iter()
+            .filter(|(repository, _)| self.is_registered(repository))
+            .collect()
     }
 
     fn process_mirror(&self, job: &mut OriginMirrorJob) {
@@ -757,16 +774,6 @@ struct Jwk {
     x: String,
 }
 
-fn allowlisted(repository: &str) -> Result<(), LoomError> {
-    if ALLOWED_REPOS.contains(&repository) {
-        Ok(())
-    } else {
-        Err(LoomError::OriginRepositoryDenied {
-            repository: repository.to_owned(),
-        })
-    }
-}
-
 fn validate_oid(oid: &str) -> Result<(), LoomError> {
     let valid = (7..=64).contains(&oid.len())
         && oid
@@ -916,7 +923,7 @@ fn extract_targets(event_type: &str, payload: &serde_json::Value) -> Vec<(String
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_owned();
-    if repo.is_empty() || allowlisted(&repo).is_err() {
+    if repo.is_empty() {
         return Vec::new();
     }
     let shas: Vec<&str> = match event_type {
