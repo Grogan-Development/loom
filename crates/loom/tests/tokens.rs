@@ -360,6 +360,109 @@ async fn git_gateway_accepts_scoped_bearer_and_basic_within_scope() {
 }
 
 #[tokio::test]
+async fn token_lookup_by_id_reconciles_without_secrets() {
+    let (_directory, router) = test_app();
+    let expiry = 4_102_444_800_u64; // 2100-01-01, far future
+    let (status, minted) = send(
+        &router,
+        json_request(
+            "POST",
+            "/v1/tokens",
+            OWNER,
+            serde_json::json!({
+                "name": "review-agent",
+                "repositories": ["demo"],
+                "perms": ["review", "features"],
+                "feature_id": "feat-1",
+                "review_id": "rev-1",
+                "expires_at": expiry,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = minted["token"]["id"].as_str().unwrap().to_owned();
+    let secret = minted["secret"].as_str().unwrap().to_owned();
+
+    // The owner can verify every reconciliation field by id.
+    let (status, body) = send(
+        &router,
+        json_request(
+            "GET",
+            &format!("/v1/tokens/{id}"),
+            OWNER,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], id.as_str());
+    assert_eq!(body["name"], "review-agent");
+    assert_eq!(body["repositories"], serde_json::json!(["demo"]));
+    assert_eq!(body["perms"], serde_json::json!(["features", "review"]));
+    assert_eq!(body["feature_id"], "feat-1");
+    assert_eq!(body["review_id"], "rev-1");
+    assert_eq!(body["expires_at"], expiry);
+    assert!(body.get("revoked_at").is_none());
+    // The bearer secret never appears anywhere in the response.
+    assert!(!body.to_string().contains(&secret));
+    assert_eq!(body["secret_sha256"].as_str().unwrap().len(), 64);
+
+    // Only the owner may read the reconciliation record.
+    let (status, _) = send(
+        &router,
+        json_request(
+            "GET",
+            &format!("/v1/tokens/{id}"),
+            &secret,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Unknown ids are distinguishable from revoked tokens.
+    let (status, body) = send(
+        &router,
+        json_request(
+            "GET",
+            "/v1/tokens/no-such-token",
+            OWNER,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "token.not_found");
+
+    // After revocation the record still reads back, now with revoked_at set.
+    let (status, _) = send(
+        &router,
+        json_request(
+            "DELETE",
+            &format!("/v1/tokens/{id}"),
+            OWNER,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &router,
+        json_request(
+            "GET",
+            &format!("/v1/tokens/{id}"),
+            OWNER,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["revoked_at"].as_u64().unwrap() > 0);
+    assert!(!body.to_string().contains(&secret));
+}
+
+#[tokio::test]
 async fn revoked_tokens_stop_resolving_immediately() {
     let (_directory, router) = test_app();
     let (id, secret) = mint(&router, "ws-revoke", &["demo"], &["features"]).await;

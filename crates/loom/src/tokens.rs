@@ -64,6 +64,10 @@ pub struct ScopedToken {
     pub expires_at: Option<u64>,
     /// Unix seconds at mint time.
     pub created_at: u64,
+    /// Unix seconds at revocation. Revoked tokens never resolve but their
+    /// record is kept so the owner can reconcile revocation explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
 }
 
 impl ScopedToken {
@@ -165,20 +169,37 @@ impl TokenStore {
         Ok(tokens)
     }
 
-    /// Revokes one token by id. Resolution stops immediately.
+    /// Revokes one token by id. Resolution stops immediately; the record is
+    /// kept with `revoked_at` set so revocation stays owner-verifiable.
     ///
     /// # Errors
     ///
-    /// Returns `UnknownToken` when the id is absent.
+    /// Returns `UnknownToken` when the id is absent or already revoked.
     pub fn revoke(&self, id: &str) -> Result<ScopedToken, LoomError> {
         let lock = self.store.exclusive_lock()?;
         let mut tokens = self.load()?;
-        let removed = tokens
-            .remove(id)
+        let token = tokens
+            .get_mut(id)
+            .filter(|token| token.revoked_at.is_none())
             .ok_or_else(|| LoomError::UnknownToken { id: id.to_owned() })?;
+        token.revoked_at = Some(unix_now());
+        let revoked = token.clone();
         self.write(&tokens)?;
         File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
-        Ok(removed)
+        Ok(revoked)
+    }
+
+    /// Reads one durable token record by id, revoked records included. The
+    /// record carries only the secret hash, never the bearer secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns for durable I/O failure.
+    pub fn get(&self, id: &str) -> Result<Option<ScopedToken>, LoomError> {
+        let lock = self.store.shared_lock()?;
+        let tokens = self.load()?;
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(tokens.get(id).cloned())
     }
 
     /// Resolves a presented secret to its live token, if any.
@@ -201,6 +222,7 @@ impl TokenStore {
         Ok(tokens.into_values().find(|token| {
             bool::from(token.secret_sha256.as_bytes().ct_eq(digest.as_bytes()))
                 && !token.expired_at(now)
+                && token.revoked_at.is_none()
         }))
     }
 
@@ -247,8 +269,8 @@ impl TokenStore {
 pub enum Principal {
     /// The owner token: unrestricted except deploy.
     Owner,
-    /// A scoped token minted by the owner.
-    Scoped(ScopedToken),
+    /// A scoped token minted by the owner (boxed: the record is large).
+    Scoped(Box<ScopedToken>),
 }
 
 impl Principal {
@@ -357,7 +379,7 @@ impl Authority {
             return Some(Principal::Owner);
         }
         match self.tokens.resolve(presented) {
-            Ok(Some(token)) => Some(Principal::Scoped(token)),
+            Ok(Some(token)) => Some(Principal::Scoped(Box::new(token))),
             Ok(None) | Err(_) => None,
         }
     }
@@ -403,6 +425,7 @@ fn validate_mint(request: &TokenMint) -> Result<ScopedToken, LoomError> {
         review_id: request.review_id.clone(),
         expires_at: request.expires_at,
         created_at,
+        revoked_at: None,
     })
 }
 

@@ -415,7 +415,10 @@ impl ReviewDispatcher {
         let Ok(tokens) = self.authority.tokens().list() else {
             return;
         };
-        for token in tokens.into_iter().filter(|token| token.name == name) {
+        for token in tokens
+            .into_iter()
+            .filter(|token| token.name == name && token.revoked_at.is_none())
+        {
             let _ = self.authority.tokens().revoke(&token.id);
         }
     }
@@ -860,7 +863,12 @@ mod tests {
             let completed = reviews
                 .get(&feature.id, &review.id)
                 .is_ok_and(|current| current.status == ReviewStatus::Completed);
-            if completed && token_store.list().unwrap().is_empty() {
+            let all_revoked = token_store
+                .list()
+                .unwrap()
+                .iter()
+                .all(|token| token.revoked_at.is_some());
+            if completed && all_revoked {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -872,7 +880,13 @@ mod tests {
         let comments = reviews.list_comments(&feature.id).unwrap();
         assert_eq!(comments.len(), 1);
         assert!(comments[0].body.contains("without recording a verdict"));
-        assert!(token_store.list().unwrap().is_empty());
+        assert!(
+            token_store
+                .list()
+                .unwrap()
+                .iter()
+                .all(|token| token.revoked_at.is_some())
+        );
 
         let request = mock.request.lock().unwrap().clone().unwrap();
         assert!(*mock.authenticated.lock().unwrap());

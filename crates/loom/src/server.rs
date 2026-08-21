@@ -14,7 +14,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event as SseEvent, KeepAlive, Sse},
     },
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use futures_util::stream::{self, StreamExt as _};
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,7 @@ impl LoomApp {
         let api = Router::new()
             .route("/healthz", get(healthz))
             .route("/v1/tokens", get(list_tokens).post(mint_token))
-            .route("/v1/tokens/{id}", delete(revoke_token))
+            .route("/v1/tokens/{id}", get(get_token).delete(revoke_token))
             .route("/v1/repos", get(list_repos).post(upsert_repo))
             .route("/v1/repos/{name}", get(get_repo).delete(delete_repo))
             .route("/loom/v1/refs/bootstrap", post(bootstrap_ref))
@@ -487,6 +487,24 @@ async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
     match state.authority.tokens().list() {
         Ok(tokens) => Json(tokens).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
+    }
+}
+
+/// Owner-only reconciliation read: exists, repos, perms, feature/review
+/// binding, expiry, and revocation for one token id. Never returns secrets;
+/// the durable record carries only the SHA-256 hash.
+async fn get_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.authority.tokens().get(&id) {
+        Ok(Some(token)) => Json(token).into_response(),
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "token.not_found"),
         Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
     }
 }
