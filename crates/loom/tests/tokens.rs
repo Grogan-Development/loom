@@ -282,6 +282,26 @@ async fn git_gateway_accepts_scoped_bearer_and_basic_within_scope() {
     let (_directory, router) = test_app();
     let (_id, secret) = mint(&router, "ws-git", &["demo"], &["git"]).await;
 
+    let challenge = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/git/demo.git/info/refs?service=git-upload-pack")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        challenge
+            .headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"loom\"")
+    );
+
     let bearer = Request::builder()
         .method("GET")
         .uri("/git/demo.git/info/refs?service=git-upload-pack")

@@ -877,7 +877,10 @@ fn git_http_error(status: StatusCode) -> Response {
     if status == StatusCode::UNAUTHORIZED {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
-            header::HeaderValue::from_static("Bearer realm=\"loom\""),
+            // Git/libcurl only asks its credential helper for the password
+            // when the Smart HTTP endpoint advertises Basic. The password is
+            // still resolved as the same Loom bearer secret server-side.
+            header::HeaderValue::from_static("Basic realm=\"loom\""),
         );
     }
     response
