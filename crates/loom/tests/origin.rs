@@ -1,7 +1,10 @@
 //! Origin webhook (verify-only), Loom-keyed release/deploy, and mirror queue.
 #![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -9,14 +12,15 @@ use axum::{
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt as _;
-use loom::PersistentLoomStore;
 use loom::auth::AccessToken;
 use loom::ci::{CiStatus, execute_command, load_pipeline};
+use loom::contracts::RepositoryRevision;
 use loom::origin::{
     OriginConfig, OriginEngine, OriginMirrorRunner, OriginMirrorStatus, OriginRelease,
     test_verifying_key, test_webhook_signature,
 };
 use loom::server::{LoomApp, ServerConfig};
+use loom::{NamespaceGrant, PersistentLoomStore};
 use tower::ServiceExt as _;
 
 const OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -208,9 +212,46 @@ async fn deploy_is_rejected_without_passing_evidence_and_without_deploy_token() 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// Writes the durable oid↔revision mapping exactly as the Git import does.
+fn write_git_mapping(
+    store_root: &Path,
+    repository: &str,
+    oid: &str,
+    revision: &RepositoryRevision,
+) {
+    let directory = store_root.join("git-mappings").join(repository);
+    fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let mapping = serde_json::json!({
+        "schema_version": "v1",
+        "repository": repository,
+        "git_oid": oid,
+        "revision": { "repository": repository, "revision": revision.revision },
+    });
+    let path = directory.join(format!("{oid}.json"));
+    fs::write(&path, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 #[tokio::test]
 async fn loom_release_record_allows_deploy_token_to_apply() {
-    let (_directory, router) = test_app(true, None);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("loom");
+    let app = LoomApp::new(ServerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        root: root.clone(),
+        token: AccessToken::new(OWNER),
+        deploy_token: Some(AccessToken::new(DEPLOY)),
+        origin: OriginConfig::for_test(directory.path().join("origin-work"), true),
+        git_program: PathBuf::from("/usr/bin/git"),
+        hook_program: PathBuf::from("/bin/true"),
+        review_runner: None,
+    })
+    .unwrap();
+    let router = app.router();
+
+    // The CI route no longer fabricates passing evidence: a SHA Loom never
+    // imported has no execution context, is refused, and records nothing.
     let (status, body) = send(
         &router,
         Request::builder()
@@ -222,10 +263,27 @@ async fn loom_release_record_allows_deploy_token_to_apply() {
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["tests_passed"], true);
-    assert_eq!(body["status"], "passed");
-    assert_eq!(body["log"], "origin.mirror_only");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "origin.revision_unknown");
+    let (status, _) = send(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/v1/releases/loom/{OID}"))
+            .header("authorization", format!("Bearer {OWNER}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Candidate acceptance records evidence through record_loom_release; the
+    // deploy token can then apply that exact SHA.
+    let engine = OriginEngine::new(
+        PersistentLoomStore::open(&root).unwrap(),
+        OriginConfig::for_test(directory.path().join("origin-work"), true),
+    );
+    engine.record_loom_release("loom", OID, true).unwrap();
 
     let (status, body) = send(
         &router,
@@ -246,6 +304,99 @@ async fn loom_release_record_allows_deploy_token_to_apply() {
         Request::builder()
             .method("POST")
             .uri(format!("/v1/releases/loom/{OID}/deploy"))
+            .header("authorization", format!("Bearer {DEPLOY}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ci_route_executes_pipeline_and_records_honest_results() {
+    const FAIL_OID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const PASS_OID: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("loom");
+    let store = PersistentLoomStore::open(&root).unwrap();
+    let grant = NamespaceGrant::new(BTreeSet::from(["loom".to_owned()]));
+    let failing = store
+        .commit(
+            &grant,
+            "loom",
+            None,
+            BTreeMap::from([(
+                "loom-ci.toml".to_owned(),
+                b"[ci]\ncommands = [[\"sh\", \"-c\", \"echo boom; exit 1\"]]\n".to_vec(),
+            )]),
+        )
+        .unwrap();
+    let passing = store
+        .commit(
+            &grant,
+            "loom",
+            Some(&failing),
+            BTreeMap::from([(
+                "loom-ci.toml".to_owned(),
+                b"[ci]\ncommands = [[\"sh\", \"-c\", \"echo real-ci-ok\"]]\n".to_vec(),
+            )]),
+        )
+        .unwrap();
+    write_git_mapping(&root, "loom", FAIL_OID, &failing);
+    write_git_mapping(&root, "loom", PASS_OID, &passing);
+    let app = LoomApp::new(ServerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        root,
+        token: AccessToken::new(OWNER),
+        deploy_token: Some(AccessToken::new(DEPLOY)),
+        origin: OriginConfig::for_test(directory.path().join("origin-work"), true),
+        git_program: PathBuf::from("/usr/bin/git"),
+        hook_program: PathBuf::from("/bin/true"),
+        review_runner: None,
+    })
+    .unwrap();
+    let router = app.router();
+
+    let run_ci = |oid: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/releases/loom/ci")
+            .header("authorization", format!("Bearer {OWNER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"git_oid":"{oid}"}}"#)))
+            .unwrap()
+    };
+
+    // The failing pipeline records failed evidence which blocks deploy.
+    let (status, body) = send(&router, run_ci(FAIL_OID)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tests_passed"], false);
+    assert_eq!(body["status"], "failed");
+    assert!(body["log"].as_str().unwrap().contains("boom"));
+    let (status, body) = send(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/releases/loom/{FAIL_OID}/deploy"))
+            .header("authorization", format!("Bearer {DEPLOY}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "origin.deploy_blocked");
+
+    // The passing pipeline records real passing evidence which allows deploy.
+    let (status, body) = send(&router, run_ci(PASS_OID)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tests_passed"], true);
+    assert_eq!(body["status"], "passed");
+    assert!(body["log"].as_str().unwrap().contains("real-ci-ok"));
+    let (status, _) = send(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/releases/loom/{PASS_OID}/deploy"))
             .header("authorization", format!("Bearer {DEPLOY}"))
             .body(Body::empty())
             .unwrap(),

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::contracts::{ArtifactDigest, RepositoryBinding};
+use crate::contracts::{ArtifactDigest, RepositoryBinding, RepositoryRevision};
 use crate::features::{Candidate, EvidenceBundle, candidate_source_key};
 use crate::grid_runner::{CreateRunnerRequest, GridRepo, GridRunner, grid_backend_requested};
 use crate::{
@@ -188,6 +188,28 @@ impl CiEngine {
         }
         self.upsert(&job)?;
         Ok(job)
+    }
+
+    /// Materializes one already-imported revision and runs its CI pipeline,
+    /// through the exact execution path candidate CI uses (including the
+    /// configured Grid backend). Returns whether the pipeline passed and the
+    /// combined command log.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the revision cannot be materialized or a command cannot
+    /// be spawned.
+    pub fn run_revision(
+        &self,
+        revision: &RepositoryRevision,
+        job_id: &str,
+    ) -> Result<(bool, String), LoomError> {
+        let binding = RepositoryBinding {
+            base: revision.clone(),
+            head: Some(revision.clone()),
+            target_ref: "refs/main".to_owned(),
+        };
+        self.execute(std::slice::from_ref(&binding), job_id)
     }
 
     /// Converts a passing job into a candidate evidence bundle.

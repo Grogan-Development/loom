@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::catalog::{RepoCatalog, RepoEntry, seed_entries};
-use crate::ci::{CiStatus, truncate_log};
+use crate::ci::{CiEngine, CiStatus, truncate_log};
 use crate::contracts::RepositoryRevision;
 use crate::deploy::apply_release;
 use crate::{LoomError, PersistentLoomStore, hex_digest, read_bounded, write_atomic};
@@ -93,7 +93,8 @@ pub struct OriginConfig {
     pub apply_timeout: Duration,
     /// Injected webhook verifying keys. Empty means skip webhook verification.
     pub webhook_keys: Vec<[u8; 32]>,
-    /// Legacy CI runner (manual `POST /v1/releases/{repo}/ci` no longer runs it).
+    /// Legacy Origin-clone CI runner (`POST /v1/releases/{repo}/ci` now runs
+    /// the Loom CI engine against the imported tree instead).
     pub ci_runner: OriginCiRunner,
     /// Skip host apply scripts after evidence checks (tests).
     pub apply_runner_noop: bool,
@@ -372,18 +373,50 @@ impl OriginEngine {
         self.upsert(release)
     }
 
-    /// Manual "record evidence" path. Does not clone from Origin or run CI.
+    /// Executes real CI for one Git-imported SHA and records the honest result.
+    ///
+    /// The SHA must have been imported through the Git gateway so Loom holds
+    /// its exact tree (`git-mappings/`). The mapped revision is materialized
+    /// and its `loom-ci.toml` pipeline runs through the same execution path
+    /// candidate CI uses, including the configured Grid backend. Without a
+    /// mapping there is no execution context: nothing is recorded and
+    /// [`LoomError::UnknownRevision`] is returned.
     ///
     /// # Errors
     ///
-    /// Returns for an unknown repository, invalid SHA, or storage failure.
+    /// Returns for an unknown repository, invalid SHA, unmapped SHA, or
+    /// storage failure.
     pub fn run_ci(&self, repository: &str, oid: &str) -> Result<OriginRelease, LoomError> {
-        let mut release = self.record_loom_release(repository, oid, true)?;
-        if release.log == "loom.evidence" {
-            "origin.mirror_only".clone_into(&mut release.log);
-            release = self.upsert(release)?;
-        }
-        Ok(release)
+        self.registered(repository)?;
+        validate_oid(oid)?;
+        let Some(revision) = self.revision_for_git_oid(repository, oid) else {
+            return Err(LoomError::UnknownRevision {
+                repository: repository.to_owned(),
+                revision: oid.to_owned(),
+            });
+        };
+        let previous = self.release(repository, oid)?;
+        let job_id = previous
+            .as_ref()
+            .map_or_else(|| Uuid::now_v7().to_string(), |item| item.job_id.clone());
+        let (passed, log) = CiEngine::new(self.store.clone()).run_revision(&revision, &job_id)?;
+        let release = OriginRelease {
+            repository: repository.to_owned(),
+            git_oid: oid.to_owned(),
+            job_id,
+            status: if passed {
+                CiStatus::Passed
+            } else {
+                CiStatus::Failed
+            },
+            tests_passed: passed,
+            log: truncate_log(&log),
+            origin_check_id: previous
+                .as_ref()
+                .and_then(|item| item.origin_check_id.clone()),
+            deployed_oid: previous.and_then(|item| item.deployed_oid),
+        };
+        self.upsert(release)
     }
 
     /// Enqueues a best-effort Origin mirror push and processes it inline.
@@ -458,6 +491,24 @@ impl OriginEngine {
             }
         }
         None
+    }
+
+    /// Resolves a Git-imported SHA to its native revision via `git-mappings/`.
+    #[must_use]
+    fn revision_for_git_oid(&self, repository: &str, oid: &str) -> Option<RepositoryRevision> {
+        let path = self
+            .store
+            .root
+            .join("git-mappings")
+            .join(repository)
+            .join(format!("{oid}.json"));
+        let bytes = read_bounded(&path, 4096).ok()?;
+        let mapping = serde_json::from_slice::<GitRevisionMapping>(&bytes).ok()?;
+        (mapping.schema_version == "v1"
+            && mapping.repository == repository
+            && mapping.git_oid == oid
+            && mapping.revision.repository == repository)
+            .then_some(mapping.revision)
     }
 
     /// Fail-closed deploy: requires `tests_passed` for this exact SHA, then

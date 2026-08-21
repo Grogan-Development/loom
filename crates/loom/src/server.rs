@@ -321,6 +321,9 @@ async fn origin_start_ci(
         Ok(Err(LoomError::OriginRepositoryDenied { .. })) => {
             feature_error(StatusCode::NOT_FOUND, "origin.repository_denied")
         }
+        Ok(Err(LoomError::UnknownRevision { .. })) => {
+            feature_error(StatusCode::NOT_FOUND, "origin.revision_unknown")
+        }
         Ok(Err(LoomError::InvalidSourceCommit)) => {
             feature_error(StatusCode::UNPROCESSABLE_ENTITY, "origin.oid_invalid")
         }
