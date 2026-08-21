@@ -11,3 +11,4 @@ run() {
 run cargo fmt --check
 run cargo clippy --locked -p loom -- -D warnings
 run cargo test --locked -p loom
+run cargo test --locked -p loom-cli

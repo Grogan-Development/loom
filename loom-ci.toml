@@ -4,4 +4,5 @@ commands = [
   ["cargo", "fmt", "--check"],
   ["cargo", "clippy", "--locked", "-p", "loom", "--", "-D", "warnings"],
   ["cargo", "test", "--locked", "-p", "loom"],
+  ["cargo", "test", "--locked", "-p", "loom-cli"],
 ]

@@ -200,7 +200,7 @@ async fn run() -> Result<(), String> {
             } => {
                 api.send(
                     Method::POST,
-                    &format!("/v1/features/{feature}/findings/{finding_id}/apply"),
+                    &review_apply_path(&feature, &finding_id),
                     Some(json!({ "approve": approve })),
                 )
                 .await
@@ -213,8 +213,8 @@ async fn run() -> Result<(), String> {
         } => {
             api.send(
                 Method::POST,
-                &format!("/v1/features/{feature}/comments"),
-                Some(json!({ "author": author, "body": body })),
+                &feature_comments_path(&feature),
+                Some(comment_body(&author, &body)),
             )
             .await
         }
@@ -382,10 +382,8 @@ impl Api {
             serde_json::from_str(&text).map_err(|error| format!("invalid JSON: {error}"))?;
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                value.pointer("/candidate/insights").unwrap_or(&Value::Null)
-            )
-            .map_err(|error| format!("serialize failed: {error}"))?
+            serde_json::to_string_pretty(insights_pointer(&value))
+                .map_err(|error| format!("serialize failed: {error}"))?
         );
         Ok(())
     }
@@ -467,11 +465,58 @@ fn print_http(status: StatusCode, text: &str) -> Result<(), String> {
     }
 }
 
+fn review_apply_path(feature: &str, finding_id: &str) -> String {
+    format!("/v1/features/{feature}/findings/{finding_id}/apply")
+}
+
+fn feature_comments_path(feature: &str) -> String {
+    format!("/v1/features/{feature}/comments")
+}
+
+fn comment_body(author: &str, body: &str) -> Value {
+    json!({ "author": author, "body": body })
+}
+
+fn insights_pointer(value: &Value) -> &Value {
+    value.pointer("/candidate/insights").unwrap_or(&Value::Null)
+}
+
 fn http_error(status: StatusCode, text: &str) -> String {
     let body = text.trim();
     if body.is_empty() {
         format!("loom HTTP {status}")
     } else {
         format!("loom HTTP {status}: {body}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{comment_body, insights_pointer, review_apply_path};
+    use serde_json::json;
+
+    #[test]
+    fn review_apply_uses_feature_scoped_route() {
+        assert_eq!(
+            review_apply_path("feat-1", "fnd-2"),
+            "/v1/features/feat-1/findings/fnd-2/apply"
+        );
+    }
+
+    #[test]
+    fn comment_includes_required_author() {
+        assert_eq!(
+            comment_body("human", "looks good"),
+            json!({ "author": "human", "body": "looks good" })
+        );
+    }
+
+    #[test]
+    fn insights_fallback_reads_candidate_pointer() {
+        let value = json!({
+            "candidate": { "insights": { "job_id": "job-1" } }
+        });
+        assert_eq!(insights_pointer(&value)["job_id"], "job-1");
+        assert!(insights_pointer(&json!({})).is_null());
     }
 }
