@@ -12,9 +12,9 @@ use loom::server::{LoomApp, ServerConfig};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "loom",
+    name = "loomd",
     version,
-    about = "Standalone Loom smart repository",
+    about = "Standalone Loom HTTP server",
     long_about = "Owner token (LOOM_TOKEN) authorizes /v1/releases/*/ci, GET evidence, features, CAS RPC, and Git.\n\
 Deploy token (LOOM_DEPLOY_TOKEN) authorizes only POST /v1/releases/{repo}/{oid}/deploy.\n\
 Origin webhooks are authenticated by Origin App signatures, not bearer tokens."

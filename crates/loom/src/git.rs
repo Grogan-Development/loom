@@ -110,13 +110,14 @@ impl SshOriginalCommand {
             .strip_prefix('\'')
             .and_then(|path| path.strip_suffix(".git'"))
             .ok_or(GitError::InvalidRequest)?;
-        validate_repository(repository).map_err(|_| GitError::InvalidRequest)?;
-        if repository.contains('/') || repository.contains('\\') {
+        let repository = percent_decode_repository(repository)?;
+        validate_repository(&repository).map_err(|_| GitError::InvalidRequest)?;
+        if repository.contains('\\') {
             return Err(GitError::InvalidRequest);
         }
         Ok(Self {
             operation,
-            repository: repository.to_owned(),
+            repository,
         })
     }
 }
@@ -325,7 +326,10 @@ impl GitBridge {
     pub fn ensure_repository(&self, repository: &str) -> Result<PathBuf, GitError> {
         validate_repository(repository).map_err(|_| GitError::InvalidRequest)?;
         let lock = self.store.exclusive_lock()?;
-        let bare = self.repositories.join(format!("{repository}.git"));
+        let bare = self.repositories.join(format!(
+            "{}.git",
+            crate::repository_storage_name(repository)
+        ));
         if !bare.exists() {
             run_git_status(
                 &self.git_program,
@@ -593,7 +597,9 @@ impl GitBridge {
         repository: &str,
         revision: &RepositoryRevision,
     ) -> Result<String, GitError> {
-        let directory = self.mappings.join(repository);
+        let directory = self
+            .mappings
+            .join(crate::repository_storage_name(repository));
         let mut paths = fs::read_dir(&directory)
             .map_err(|_| GitError::BackendUnavailable)?
             .map(|entry| {
@@ -706,7 +712,9 @@ impl GitBridge {
         git_oid: &str,
         revision: &RepositoryRevision,
     ) -> Result<(), GitError> {
-        let directory = self.mappings.join(repository);
+        let directory = self
+            .mappings
+            .join(crate::repository_storage_name(repository));
         ensure_private_directory(&directory)?;
         let mapping = GitRevisionMapping {
             schema_version: "v1".to_owned(),
@@ -730,7 +738,7 @@ impl GitBridge {
 
     fn mapping_path(&self, repository: &str, git_oid: &str) -> PathBuf {
         self.mappings
-            .join(repository)
+            .join(crate::repository_storage_name(repository))
             .join(format!("{git_oid}.json"))
     }
 }
@@ -772,10 +780,10 @@ fn parse_http_request(request: &Request) -> Result<GitHttpRequest, GitError> {
         .ok_or(GitError::InvalidRequest)?;
     let (repository, suffix) = relative
         .split_once(".git/")
-        .or_else(|| relative.split_once('/'))
         .ok_or(GitError::InvalidRequest)?;
-    validate_repository(repository).map_err(|_| GitError::InvalidRequest)?;
-    if repository.contains('/') || repository.contains('\\') {
+    let repository = percent_decode_repository(repository)?;
+    validate_repository(&repository).map_err(|_| GitError::InvalidRequest)?;
+    if repository.contains('\\') {
         return Err(GitError::InvalidRequest);
     }
     let query = request.uri().query().unwrap_or_default();
@@ -803,13 +811,43 @@ fn parse_http_request(request: &Request) -> Result<GitHttpRequest, GitError> {
         return Err(GitError::InvalidRequest);
     };
     Ok(GitHttpRequest {
-        repository: repository.to_owned(),
+        repository: repository.clone(),
         operation,
         method: request.method().clone(),
-        path_info: format!("/{repository}.git/{suffix}"),
+        path_info: format!(
+            "/{}.git/{suffix}",
+            crate::repository_storage_name(&repository)
+        ),
         query: query.to_owned(),
         content_type,
     })
+}
+
+fn percent_decode_repository(value: &str) -> Result<String, GitError> {
+    let mut decoded = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                    .map_err(|_| GitError::InvalidRequest)?;
+                let byte = u8::from_str_radix(hex, 16).map_err(|_| GitError::InvalidRequest)?;
+                if byte > 0x7f {
+                    return Err(GitError::InvalidRequest);
+                }
+                decoded.push(char::from(byte));
+                index += 3;
+            }
+            b'%' => return Err(GitError::InvalidRequest),
+            byte if byte.is_ascii() => {
+                decoded.push(char::from(byte));
+                index += 1;
+            }
+            _ => return Err(GitError::InvalidRequest),
+        }
+    }
+    Ok(decoded)
 }
 
 fn parse_git_service(service: &str) -> Result<GitOperation, GitError> {

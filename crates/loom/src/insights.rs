@@ -67,7 +67,7 @@ pub struct RepoInsights {
     pub base: String,
     /// Head revision hex.
     pub head: String,
-    /// Detected toolchain: `cargo`, `go`, `node`, or `unknown`.
+    /// Detected toolchain: `cargo`, `go`, `python`, `node`, or `unknown`.
     pub toolchain: String,
     /// File-level diff between materializations.
     pub diffstat: DiffStat,
@@ -635,6 +635,12 @@ fn detect_toolchain(
         "cargo".to_owned()
     } else if head_files.contains_key("go.mod") || base_files.contains_key("go.mod") {
         "go".to_owned()
+    } else if head_files.contains_key("pyproject.toml")
+        || base_files.contains_key("pyproject.toml")
+        || head_files.contains_key("requirements.txt")
+        || base_files.contains_key("requirements.txt")
+    {
+        "python".to_owned()
     } else if head_files.contains_key("package.json") || base_files.contains_key("package.json") {
         "node".to_owned()
     } else {
@@ -761,7 +767,6 @@ fn lsp_delta(
     let server = match toolchain {
         "cargo" => "rust-analyzer",
         "go" => "gopls",
-        "node" => "typescript-language-server",
         _ => {
             return skipped_diagnostics("lsp: skipped");
         }
@@ -836,14 +841,7 @@ fn collect_lsp(
                 ],
             )?,
             "typescript-language-server" => {
-                run_ls(
-                    workspace.path(),
-                    &[
-                        "typescript-language-server".to_owned(),
-                        "--stdio".to_owned(),
-                    ],
-                )?;
-                String::new()
+                return Ok(Vec::new());
             }
             "rust-analyzer" => run_ls(
                 workspace.path(),
@@ -907,6 +905,7 @@ enum Language {
     Rust,
     Go,
     JavaScript,
+    Python,
     Unknown,
 }
 
@@ -924,6 +923,7 @@ fn language_for(path: &str) -> Language {
         "rs" => Language::Rust,
         "go" => Language::Go,
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
+        "py" => Language::Python,
         _ => Language::Unknown,
     }
 }
@@ -933,6 +933,7 @@ fn extract_symbols(language: Language, path: &str, text: &str) -> Vec<ExtractedS
         Language::Rust => extract_rust(path, text),
         Language::Go => extract_go(path, text),
         Language::JavaScript => extract_js(path, text),
+        Language::Python => extract_python(path, text),
         Language::Unknown => Vec::new(),
     }
 }
@@ -1103,6 +1104,35 @@ fn js_export(line: &str) -> Option<String> {
             !part.is_empty() && *part != "default" && *part != "const" && *part != "let"
         })?;
     Some((*name).to_owned())
+}
+
+fn extract_python(path: &str, text: &str) -> Vec<ExtractedSymbol> {
+    let mut symbols = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("def ") {
+            let name = rest.split('(').next().unwrap_or("").trim();
+            if !name.is_empty() {
+                symbols.push(symbol_node(path, "def", name, "defines"));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("class ") {
+            let name = rest.split(['(', ':']).next().unwrap_or("").trim();
+            if !name.is_empty() {
+                symbols.push(symbol_node(path, "class", name, "defines"));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("import ") {
+            let name = rest.split([',', ' ']).next().unwrap_or("").trim();
+            if !name.is_empty() {
+                symbols.push(symbol_node(path, "import", name, "imports"));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("from ") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if !name.is_empty() {
+                symbols.push(symbol_node(path, "from", name, "imports"));
+            }
+        }
+    }
+    symbols
 }
 
 fn symbol_node(path: &str, kind: &str, name: &str, edge_kind: &str) -> ExtractedSymbol {

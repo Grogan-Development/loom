@@ -70,6 +70,102 @@ enum Command {
     },
     /// Print cwd, env, and a features listing.
     Status,
+    /// Write `~/.config/loom/credentials` (env still wins).
+    Login {
+        /// Loom base URL.
+        #[arg(long)]
+        url: String,
+        /// Bearer token.
+        #[arg(long)]
+        token: String,
+    },
+    /// Catalog repositories.
+    Repo {
+        #[command(subcommand)]
+        action: RepoAction,
+    },
+    /// Projects.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+    /// Apps / services.
+    App {
+        #[command(subcommand)]
+        action: AppAction,
+    },
+    /// Maintain queue.
+    Maintain {
+        #[command(subcommand)]
+        action: MaintainAction,
+    },
+    /// Dump a backup tarball.
+    Backup {
+        /// Destination path.
+        destination: PathBuf,
+    },
+    /// Print the MCP tool list. HTTP MCP calls are 501.
+    Mcp,
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoAction {
+    /// POST `/v1/repos/import`.
+    Import {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        name: String,
+        git_url: Option<String>,
+        #[arg(long)]
+        no_app: bool,
+        #[arg(long)]
+        no_maintain: bool,
+    },
+    /// GET `/v1/repos`.
+    List,
+    /// GET `/v1/repos/{name}`.
+    Show { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectAction {
+    /// POST `/v1/projects`.
+    Create { name: String },
+    /// GET `/v1/projects`.
+    List,
+    /// GET `/v1/projects/{name}`.
+    Show { name: String },
+    /// POST `/v1/projects/{name}/pause`.
+    Pause { name: String },
+    /// POST `/v1/projects/{name}/pause` with paused=false.
+    Resume { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum AppAction {
+    /// GET `/v1/apps`.
+    List,
+    /// GET `/v1/apps/{id}`.
+    Show { id: String },
+    /// POST `/v1/apps/{id}/promote`.
+    Promote {
+        id: String,
+        #[arg(long, default_value = "production")]
+        environment: String,
+    },
+    /// POST `/v1/apps/{id}/rollback`.
+    Rollback {
+        id: String,
+        #[arg(long, default_value = "production")]
+        environment: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintainAction {
+    /// GET `/v1/maintain`.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,13 +234,22 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    // Cargo builds this package as `loom-cli` so the host can keep `loom` for
-    // the server. Grid exposes the client as `loom`; pin argv[0] so help and
-    // errors use that stable guest-facing identity through either alias.
-    let cli = Cli::parse_from(
-        std::iter::once(std::ffi::OsString::from("loom")).chain(std::env::args_os().skip(1)),
-    );
+    let cli = Cli::parse();
+    match &cli.command {
+        Command::Login { url, token } => return write_credentials(url, token),
+        Command::Mcp => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "tools": ["repo","git","feature","candidate","evidence","events","token","project","app","maintain"]
+                })
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
     let api = Api::from_env()?;
+    #[allow(unreachable_patterns)]
     match cli.command {
         Command::Events {
             follow,
@@ -225,13 +330,159 @@ async fn run() -> Result<(), String> {
             .await
         }
         Command::Status => api.status().await,
+        Command::Repo { action } => match action {
+            RepoAction::Import {
+                project,
+                name,
+                git_url,
+                no_app,
+                no_maintain,
+            } => {
+                api.send(
+                    Method::POST,
+                    "/v1/repos/import",
+                    Some(json!({
+                        "project": project,
+                        "name": name,
+                        "git_url": git_url.unwrap_or_default(),
+                        "app": !no_app,
+                        "maintain": !no_maintain,
+                    })),
+                )
+                .await
+            }
+            RepoAction::List => api.send(Method::GET, "/v1/repos", None).await,
+            RepoAction::Show { name } => {
+                api.send(Method::GET, &format!("/v1/repos/{name}"), None)
+                    .await
+            }
+        },
+        Command::Project { action } => match action {
+            ProjectAction::Create { name } => {
+                api.send(Method::POST, "/v1/projects", Some(json!({ "name": name })))
+                    .await
+            }
+            ProjectAction::List => api.send(Method::GET, "/v1/projects", None).await,
+            ProjectAction::Show { name } => {
+                api.send(Method::GET, &format!("/v1/projects/{name}"), None)
+                    .await
+            }
+            ProjectAction::Pause { name } => {
+                api.send(
+                    Method::POST,
+                    &format!("/v1/projects/{name}/pause"),
+                    Some(json!({ "paused": true })),
+                )
+                .await
+            }
+            ProjectAction::Resume { name } => {
+                api.send(
+                    Method::POST,
+                    &format!("/v1/projects/{name}/pause"),
+                    Some(json!({ "paused": false })),
+                )
+                .await
+            }
+        },
+        Command::App { action } => match action {
+            AppAction::List => api.send(Method::GET, "/v1/apps", None).await,
+            AppAction::Show { id } => api.send(Method::GET, &format!("/v1/apps/{id}"), None).await,
+            AppAction::Promote { id, environment } => {
+                api.send(
+                    Method::POST,
+                    "/v1/apps/promote",
+                    Some(json!({ "id": id, "environment": environment })),
+                )
+                .await
+            }
+            AppAction::Rollback { id, environment } => {
+                api.send(
+                    Method::POST,
+                    "/v1/apps/rollback",
+                    Some(json!({ "id": id, "environment": environment })),
+                )
+                .await
+            }
+        },
+        Command::Maintain { action } => match action {
+            MaintainAction::Status => api.send(Method::GET, "/v1/maintain", None).await,
+        },
+        Command::Backup { destination } => {
+            api.send(
+                Method::POST,
+                "/v1/backup",
+                Some(json!({ "destination": destination })),
+            )
+            .await
+        }
+        Command::Login { .. } | Command::Mcp => {
+            Err("internal: login/mcp handled before HTTP client".to_owned())
+        }
+    }
+}
+
+fn write_credentials(url: &str, token: &str) -> Result<(), String> {
+    let path = credentials_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("mkdir: {error}"))?;
+    }
+    std::fs::write(&path, format!("LOOM_URL={url}\nLOOM_TOKEN={token}\n"))
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn credentials_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is required".to_owned())?;
+    Ok(PathBuf::from(home).join(".config/loom/credentials"))
+}
+
+struct FileCredentials {
+    url: Option<String>,
+    token: Option<String>,
+}
+
+impl Default for FileCredentials {
+    fn default() -> Self {
+        Self {
+            url: None,
+            token: None,
+        }
+    }
+}
+
+fn read_credentials() -> Result<FileCredentials, String> {
+    let path = credentials_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(FileCredentials::default()),
+    };
+    let mut file = FileCredentials::default();
+    for line in raw.lines() {
+        if let Some(value) = line.strip_prefix("LOOM_URL=") {
+            file.url = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix("LOOM_TOKEN=") {
+            file.token = Some(value.to_owned());
+        }
+    }
+    Ok(file)
+}
+
+fn env_or_file(var: &str, file: Option<&str>) -> Result<String, String> {
+    match std::env::var(var) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) | Err(_) => file
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("{var} is required")),
     }
 }
 
 impl Api {
     fn from_env() -> Result<Self, String> {
-        let raw_url = std::env::var("LOOM_URL").map_err(|_| "LOOM_URL is required".to_owned())?;
-        let token = std::env::var("LOOM_TOKEN").map_err(|_| "LOOM_TOKEN is required".to_owned())?;
+        let file = read_credentials().unwrap_or_default();
+        let raw_url = env_or_file("LOOM_URL", file.url.as_deref())?;
+        let token = env_or_file("LOOM_TOKEN", file.token.as_deref())?;
         if raw_url.is_empty() || token.is_empty() {
             return Err("LOOM_URL and LOOM_TOKEN must be non-empty".to_owned());
         }
@@ -498,7 +749,7 @@ fn http_error(status: StatusCode, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{comment_body, insights_pointer, review_apply_path};
+    use super::{comment_body, env_or_file, insights_pointer, review_apply_path};
     use serde_json::json;
 
     #[test]
@@ -524,5 +775,15 @@ mod tests {
         });
         assert_eq!(insights_pointer(&value)["job_id"], "job-1");
         assert!(insights_pointer(&json!({})).is_null());
+    }
+
+    #[test]
+    fn env_wins_over_file_and_file_fills_when_env_missing() {
+        assert_eq!(
+            env_or_file("LOOM_URL_UNSET_FOR_TEST", Some("https://from-file")).unwrap(),
+            "https://from-file"
+        );
+        let err = env_or_file("LOOM_URL_UNSET_FOR_TEST", None).unwrap_err();
+        assert!(err.contains("LOOM_URL_UNSET_FOR_TEST"));
     }
 }

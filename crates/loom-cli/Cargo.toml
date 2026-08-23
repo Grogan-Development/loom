@@ -9,7 +9,7 @@ repository.workspace = true
 description = "HTTP CLI for the standalone Loom API."
 
 [[bin]]
-name = "loom-cli"
+name = "loom"
 path = "src/main.rs"
 
 [dependencies]

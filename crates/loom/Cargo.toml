@@ -9,8 +9,8 @@ repository.workspace = true
 description = "Standalone smart repository: CAS source, feature contracts, lightning CI."
 
 [[bin]]
-name = "loom"
-path = "src/bin/loom.rs"
+name = "loomd"
+path = "src/bin/loomd.rs"
 
 [[bin]]
 name = "loom-git-hook"
@@ -21,6 +21,7 @@ name = "loom-insights"
 path = "src/bin/loom-insights.rs"
 
 [dependencies]
+aes-gcm.workspace = true
 axum.workspace = true
 base64ct.workspace = true
 clap.workspace = true

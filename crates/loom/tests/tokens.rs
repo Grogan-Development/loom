@@ -28,7 +28,7 @@ fn test_app() -> (tempfile::TempDir, axum::Router) {
         deploy_token: None,
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();
@@ -254,6 +254,8 @@ async fn scoped_token_gates_features_by_repository() {
 #[tokio::test]
 async fn scoped_token_gates_evidence_and_missing_perm_is_forbidden() {
     let (_directory, router) = test_app();
+    register_repo(&router, "grid").await;
+    register_repo(&router, "loom").await;
     let (_id, secret) = mint(&router, "runner", &["grid"], &["evidence"]).await;
 
     // In-scope: auth passes, release is simply absent.

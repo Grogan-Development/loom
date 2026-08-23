@@ -13,6 +13,7 @@ use axum::{
 };
 use http_body_util::BodyExt as _;
 use loom::auth::AccessToken;
+use loom::catalog::{DeployTarget, RepoCatalog, RepoEntry};
 use loom::ci::{CiStatus, execute_command, load_pipeline};
 use loom::contracts::RepositoryRevision;
 use loom::origin::{
@@ -41,18 +42,52 @@ fn test_app(passed: bool, webhook_secret: Option<[u8; 32]>) -> (tempfile::TempDi
     if let Some(secret) = webhook_secret {
         origin.webhook_keys = vec![test_verifying_key(&secret)];
     }
+    let root = directory.path().join("loom");
+    let store = PersistentLoomStore::open(&root).unwrap();
+    register_release_repos(&store);
     let app = LoomApp::new(ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
-        root: directory.path().join("loom"),
+        root,
         token: AccessToken::new(OWNER),
         deploy_token: Some(AccessToken::new(DEPLOY)),
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();
     (directory, app.router())
+}
+
+fn register_release_repos(store: &PersistentLoomStore) {
+    let catalog = RepoCatalog::open(store.clone());
+    catalog
+        .upsert(RepoEntry {
+            name: "loom".to_owned(),
+            protected_ref: "refs/main".to_owned(),
+            checkout_path: None,
+            ci: loom::catalog::CiPolicy::LoomCi,
+            deploy_target: DeployTarget::LocalApply {
+                script: PathBuf::from("/usr/local/sbin/loom-apply"),
+            },
+            description: String::new(),
+        })
+        .unwrap();
+    for name in ["grid", "nero"] {
+        catalog
+            .upsert(RepoEntry {
+                name: name.to_owned(),
+                protected_ref: "refs/main".to_owned(),
+                checkout_path: None,
+                ci: loom::catalog::CiPolicy::LoomCi,
+                deploy_target: DeployTarget::SshApply {
+                    host: None,
+                    script: PathBuf::from("/usr/local/sbin/remote-apply"),
+                },
+                description: String::new(),
+            })
+            .unwrap();
+    }
 }
 
 fn test_engine(mirror_ok: bool) -> (tempfile::TempDir, OriginEngine) {
@@ -67,7 +102,9 @@ fn test_engine(mirror_ok: bool) -> (tempfile::TempDir, OriginEngine) {
         },
     };
     let store = PersistentLoomStore::open(directory.path().join("loom")).unwrap();
-    (directory, OriginEngine::new(store, config))
+    let origin = OriginEngine::new(store.clone(), config);
+    register_release_repos(&store);
+    (directory, origin)
 }
 
 async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -219,7 +256,9 @@ fn write_git_mapping(
     oid: &str,
     revision: &RepositoryRevision,
 ) {
-    let directory = store_root.join("git-mappings").join(repository);
+    let directory = store_root
+        .join("git-mappings")
+        .join(loom::repository_storage_name(repository));
     fs::create_dir_all(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let mapping = serde_json::json!({
@@ -237,6 +276,8 @@ fn write_git_mapping(
 async fn loom_release_record_allows_deploy_token_to_apply() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("loom");
+    let store = PersistentLoomStore::open(&root).unwrap();
+    register_release_repos(&store);
     let app = LoomApp::new(ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         root: root.clone(),
@@ -244,7 +285,7 @@ async fn loom_release_record_allows_deploy_token_to_apply() {
         deploy_token: Some(AccessToken::new(DEPLOY)),
         origin: OriginConfig::for_test(directory.path().join("origin-work"), true),
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();
@@ -344,6 +385,7 @@ async fn ci_route_executes_pipeline_and_records_honest_results() {
         .unwrap();
     write_git_mapping(&root, "loom", FAIL_OID, &failing);
     write_git_mapping(&root, "loom", PASS_OID, &passing);
+    register_release_repos(&store);
     let app = LoomApp::new(ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         root,
@@ -351,7 +393,7 @@ async fn ci_route_executes_pipeline_and_records_honest_results() {
         deploy_token: Some(AccessToken::new(DEPLOY)),
         origin: OriginConfig::for_test(directory.path().join("origin-work"), true),
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();
@@ -446,9 +488,10 @@ fn sha_keyed_release_lookup_round_trips() {
     let directory = tempfile::tempdir().unwrap();
     let store = PersistentLoomStore::open(directory.path().join("loom")).unwrap();
     let origin = OriginEngine::new(
-        store,
+        store.clone(),
         OriginConfig::for_test(directory.path().join("work"), false),
     );
+    register_release_repos(&store);
     origin
         .put_release(OriginRelease {
             repository: "grid".to_owned(),

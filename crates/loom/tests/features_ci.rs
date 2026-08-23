@@ -66,6 +66,9 @@ fn feature_two_gate_promote_is_atomic_and_reversible() {
                 then: "refs/main moves".to_owned(),
             }],
             evidence_policy: EvidencePolicy::minimum(),
+            class: loom::features::FeatureClass::Product,
+            subclass: None,
+            fingerprint: None,
         })
         .unwrap();
     assert_eq!(feature.gate, FeatureGate::Draft);

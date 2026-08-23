@@ -19,22 +19,34 @@ use axum::{
 use futures_util::stream::{self, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentConfig;
+use crate::app::{AppCreate, EnvAction, pin_environment, rollback_environment};
 use crate::auth::{AccessToken, bearer_token};
+use crate::backup::{backup, restore};
 use crate::catalog::{RepoCatalog, RepoUpsert};
 use crate::ci::CiEngine;
 use crate::contracts::RepositoryRevision;
+use crate::control::ControlStore;
+use crate::dashboard::StatusPage;
 use crate::events::{DEFAULT_CATCH_UP, Event, EventLog, MAX_CATCH_UP};
-use crate::features::{CandidateSubmit, Feature, FeatureCreate, FeatureStore, promotion_updates};
+use crate::features::{
+    CandidateSubmit, Feature, FeatureClass, FeatureCreate, FeatureStore, promotion_updates,
+};
 use crate::git::{GitBridge, GitHttpGateway};
+use crate::import::ImportRequest;
 use crate::insights::InsightsEngine; // insights-slice
+use crate::maintain::{MaintainStatus, enqueue, ensure_maintain_bot};
 use crate::origin::{OriginCiRequest, OriginConfig, OriginEngine, OriginEvidence, OriginMirrorJob};
+use crate::project::{PauseRequest, ProjectUpsert};
 use crate::review::{
     CommentCreate, FindingApply, FindingsAppend, ReviewComplete, ReviewStart, ReviewStatus,
     ReviewStore,
 };
 use crate::review_runner::{ReviewDispatcher, ReviewRunnerConfig};
+use crate::secrets::{SecretStore, SecretUpsert};
 use crate::tokens::{Authority, Principal, TokenMint, TokenPerm, TokenStore};
-use crate::{AtomicRefResult, LoomError, LoomRpc, NamespaceGrant, PersistentLoomStore};
+use crate::webhook::WebhookCreate;
+use crate::{LoomError, LoomRpc, NamespaceGrant, PersistentLoomStore};
 use tokio::sync::broadcast;
 
 /// Runtime configuration for the combined Loom server.
@@ -73,6 +85,9 @@ struct AppState {
     store: PersistentLoomStore,
     events: EventLog, // events-slice
     review_dispatcher: Option<ReviewDispatcher>,
+    control: ControlStore,
+    secrets: SecretStore,
+    agent: AgentConfig,
 }
 
 /// Combined Loom process: native RPC + features + lightning CI + Git HTTP.
@@ -87,6 +102,7 @@ impl LoomApp {
     /// # Errors
     ///
     /// Returns for unsafe roots, missing Git executables, or storage failure.
+    #[allow(clippy::too_many_lines)]
     pub fn new(config: ServerConfig) -> Result<Self, LoomError> {
         let store = PersistentLoomStore::open(&config.root)?;
         let features = FeatureStore::new(store.clone());
@@ -119,6 +135,15 @@ impl LoomApp {
         if let Some(dispatcher) = &review_dispatcher {
             dispatcher.recover()?;
         }
+        let control = ControlStore::new(store.clone());
+        let secrets_key = std::env::var("LOOM_SECRETS_KEY").unwrap_or_default();
+        let secrets = SecretStore::new(store.clone(), &secrets_key);
+        let agent = AgentConfig::from_env();
+        if !secrets_key.is_empty()
+            && let Ok(Some(path)) = ensure_maintain_bot(&store, authority.tokens())
+        {
+            eprintln!("loom: maintain bot token written to {path}");
+        }
         let state = AppState {
             token: config.token,
             deploy_token: config.deploy_token,
@@ -133,13 +158,19 @@ impl LoomApp {
             store,
             events,
             review_dispatcher,
+            control,
+            secrets,
+            agent,
         };
         let api = Router::new()
+            .route("/", get(dashboard))
+            .route("/status", get(dashboard))
             .route("/healthz", get(healthz))
             .route("/v1/tokens", get(list_tokens).post(mint_token))
             .route("/v1/tokens/{id}", get(get_token).delete(revoke_token))
             .route("/v1/repos", get(list_repos).post(upsert_repo))
-            .route("/v1/repos/{name}", get(get_repo).delete(delete_repo))
+            .route("/v1/repos/import", post(import_repo))
+            .route("/v1/repos/{*name}", get(get_repo).delete(delete_repo))
             .route("/loom/v1/refs/bootstrap", post(bootstrap_ref))
             .route("/v1/events", get(list_events)) // events-slice
             .route("/v1/features", get(list_features).post(create_feature))
@@ -181,6 +212,30 @@ impl LoomApp {
                 post(origin_deploy_release),
             )
             .route("/v1/mirrors", get(origin_list_mirrors))
+            .route("/v1/projects", get(list_projects).post(upsert_project))
+            .route(
+                "/v1/projects/{name}",
+                get(get_project).delete(delete_project),
+            )
+            .route("/v1/projects/{name}/pause", post(pause_project))
+            .route(
+                "/v1/projects/{name}/secrets",
+                get(list_secrets).post(upsert_secret),
+            )
+            .route("/v1/search", get(search_repo))
+            .route("/v1/compare", post(compare_revisions))
+            .route("/v1/tree", post(tree_revision))
+            .route("/v1/blob", post(blob_revision))
+            .route("/v1/apps", get(list_apps).post(create_app))
+            .route("/v1/apps/gc", post(gc_apps))
+            .route("/v1/apps/promote", post(promote_app))
+            .route("/v1/apps/rollback", post(rollback_app))
+            .route("/v1/apps/{*id}", get(get_app))
+            .route("/v1/maintain", get(maintain_status))
+            .route("/v1/webhooks", get(list_webhooks).post(create_webhook))
+            .route("/v1/backup", post(create_backup))
+            .route("/v1/restore", post(restore_backup))
+            .route("/v1/mcp", get(mcp_manifest).post(mcp_call))
             .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
             .with_state(state);
         let router = Router::new().merge(api).merge(rpc).nest("/git", git_router);
@@ -787,6 +842,9 @@ async fn create_feature(
         Ok(principal) => principal,
         Err(response) => return *response,
     };
+    if request.class == FeatureClass::Maintenance {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "feature.invalid");
+    }
     if !principal.allows(
         TokenPerm::Features,
         request
@@ -995,12 +1053,21 @@ async fn accept_feature(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Err(response) = require_token(&state, &headers) {
-        return *response;
-    }
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     let Ok(feature) = state.features.get(&id) else {
         return feature_error(StatusCode::NOT_FOUND, "feature.not_found");
     };
+    let repos = feature_repositories(&feature).collect::<Vec<_>>();
+    let may_accept = match feature.class {
+        FeatureClass::Product => principal.is_owner(),
+        FeatureClass::Maintenance => principal.allows_maintain(repos),
+    };
+    if !may_accept {
+        return unauthorized();
+    }
     // review-slice
     if feature.evidence_policy.review_blocking && !state.reviews.blocking_ok(&id) {
         return feature_error(StatusCode::CONFLICT, "review.blocking");
@@ -1580,17 +1647,527 @@ fn feature_error(status: StatusCode, code: &str) -> Response {
         .into_response()
 }
 
-/// Helper used by docs; the native RPC remains mounted at `/loom/v1/*`.
-#[must_use]
-pub fn native_rpc_prefix() -> &'static str {
-    "/loom/v1"
+async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match StatusPage::load(&state.control, &state.events, state.agent.configured()) {
+        Ok(page) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            page.render(),
+        )
+            .into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
 }
 
-/// Dataset path helper.
-#[must_use]
-pub fn dataset_root(root: &Path) -> &Path {
-    root
+async fn list_projects(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.list_projects() {
+        Ok(projects) => Json(projects).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
 }
 
-/// Unused atomic result alias for documentation.
-pub type PromotionResult = AtomicRefResult;
+async fn upsert_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProjectUpsert>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let Ok(project) = request.into_project() else {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "project.invalid");
+    };
+    match state.control.upsert_project(project) {
+        Ok(project) => (StatusCode::CREATED, Json(project)).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn get_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.get_project(&name) {
+        Ok(Some(project)) => Json(project).into_response(),
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "project.unknown"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn delete_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.delete_project(&name) {
+        Ok(project) => Json(project).into_response(),
+        Err(LoomError::UnknownProject { .. }) => {
+            feature_error(StatusCode::NOT_FOUND, "project.unknown")
+        }
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn pause_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<PauseRequest>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.get_project(&name) {
+        Ok(Some(mut project)) => {
+            project.maintain_policy.paused = request.paused;
+            match state.control.upsert_project(project) {
+                Ok(project) => Json(project).into_response(),
+                Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+            }
+        }
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "project.unknown"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn list_secrets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.secrets.list(&name) {
+        Ok(records) => Json(records).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn upsert_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(mut request): Json<SecretUpsert>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    request.project = name;
+    match state.secrets.upsert(request) {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
+        Err(LoomError::InvalidControl | LoomError::ResourceLimit) => {
+            feature_error(StatusCode::UNPROCESSABLE_ENTITY, "secret.invalid")
+        }
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn import_repo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ImportRequest>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let workdir = state.store.root.join("import-work");
+    let create_app = request.app;
+    let arm_maintain = request.maintain;
+    match crate::import::import(
+        &state.store,
+        &state.catalog,
+        state.git_bridge.as_ref(),
+        &workdir,
+        &request,
+    ) {
+        Ok(result) => {
+            if create_app && result.flags.create_app {
+                let files = state
+                    .store
+                    .materialize(
+                        &NamespaceGrant::new([result.repo.clone()].into_iter().collect()),
+                        &RepositoryRevision::new(&result.repo, &result.revision).unwrap_or_else(
+                            |_| RepositoryRevision {
+                                repository: result.repo.clone(),
+                                revision: result.revision.clone(),
+                            },
+                        ),
+                    )
+                    .unwrap_or_default();
+                if let Ok(app) = (AppCreate {
+                    project: result
+                        .repo
+                        .split_once('/')
+                        .map_or_else(|| result.repo.clone(), |(project, _)| project.to_owned()),
+                    name: result
+                        .repo
+                        .split_once('/')
+                        .map_or_else(|| result.repo.clone(), |(_, name)| name.to_owned()),
+                    repo: Some(result.repo.clone()),
+                    kind: None,
+                    start: Vec::new(),
+                })
+                .into_record(&files)
+                {
+                    let _ = state.control.upsert_app(app);
+                }
+            }
+            if arm_maintain && result.flags.arm_maintain {
+                let _ = enqueue(
+                    &state.control,
+                    &result.repo,
+                    if result.flags.needs_legacy {
+                        "runtime"
+                    } else {
+                        "deps"
+                    },
+                    "import",
+                    state.agent.configured(),
+                );
+            }
+            (StatusCode::CREATED, Json(result)).into_response()
+        }
+        Err(LoomError::InvalidControl | LoomError::InvalidRepository { .. }) => {
+            feature_error(StatusCode::UNPROCESSABLE_ENTITY, "import.invalid")
+        }
+        Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "import.failed"),
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    repo: String,
+    revision: String,
+}
+
+async fn search_repo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let Ok(revision) = RepositoryRevision::new(&query.repo, &query.revision) else {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "search.invalid");
+    };
+    let grant = NamespaceGrant::new([query.repo.clone()].into_iter().collect());
+    match crate::search::search(&state.store, &grant, &revision, &query.q, 50) {
+        Ok(hits) => Json(hits).into_response(),
+        Err(_) => feature_error(StatusCode::NOT_FOUND, "search.miss"),
+    }
+}
+
+#[derive(Deserialize)]
+struct RevisionPair {
+    repo: String,
+    base: String,
+    head: String,
+}
+
+async fn compare_revisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RevisionPair>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let Ok(base) = RepositoryRevision::new(&request.repo, &request.base) else {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "compare.invalid");
+    };
+    let Ok(head) = RepositoryRevision::new(&request.repo, &request.head) else {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "compare.invalid");
+    };
+    let grant = NamespaceGrant::new([request.repo].into_iter().collect());
+    match crate::search::compare(&state.store, &grant, &base, &head) {
+        Ok(delta) => Json(delta).into_response(),
+        Err(_) => feature_error(StatusCode::NOT_FOUND, "compare.miss"),
+    }
+}
+
+#[derive(Deserialize)]
+struct RevisionRef {
+    repo: String,
+    revision: String,
+    #[serde(default)]
+    path: String,
+}
+
+async fn tree_revision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RevisionRef>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let Ok(revision) = RepositoryRevision::new(&request.repo, &request.revision) else {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "tree.invalid");
+    };
+    let grant = NamespaceGrant::new([request.repo].into_iter().collect());
+    match crate::search::tree(&state.store, &grant, &revision) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(_) => feature_error(StatusCode::NOT_FOUND, "tree.miss"),
+    }
+}
+
+async fn blob_revision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RevisionRef>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let Ok(revision) = RepositoryRevision::new(&request.repo, &request.revision) else {
+        return feature_error(StatusCode::UNPROCESSABLE_ENTITY, "blob.invalid");
+    };
+    let grant = NamespaceGrant::new([request.repo].into_iter().collect());
+    match crate::search::blob(&state.store, &grant, &revision, &request.path) {
+        Ok(bytes) => bytes.into_response(),
+        Err(_) => feature_error(StatusCode::NOT_FOUND, "blob.miss"),
+    }
+}
+
+async fn list_apps(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.list_apps() {
+        Ok(apps) => Json(apps).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn create_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AppCreate>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let files = request
+        .repo
+        .as_ref()
+        .map_or_else(std::collections::BTreeMap::new, |repo| {
+            state
+                .catalog
+                .get(repo)
+                .ok()
+                .flatten()
+                .and_then(|entry| {
+                    let grant = NamespaceGrant::new([repo.clone()].into_iter().collect());
+                    state
+                        .store
+                        .resolve_ref(&grant, repo, &entry.protected_ref)
+                        .ok()
+                        .and_then(|revision| state.store.materialize(&grant, &revision).ok())
+                })
+                .unwrap_or_default()
+        });
+    match request.into_record(&files) {
+        Ok(app) => match state.control.upsert_app(app) {
+            Ok(app) => (StatusCode::CREATED, Json(app)).into_response(),
+            Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+        },
+        Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "app.invalid"),
+    }
+}
+
+async fn get_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.get_app(&id) {
+        Ok(Some(app)) => Json(app).into_response(),
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "app.unknown"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn promote_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(action): Json<EnvAction>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.get_app(&action.id) {
+        Ok(Some(mut app)) => {
+            let digest = app
+                .environments
+                .get("staging")
+                .map(|env| env.image_digest.clone())
+                .unwrap_or_default();
+            if digest.is_empty() {
+                return feature_error(StatusCode::CONFLICT, "app.image_missing");
+            }
+            pin_environment(&mut app, &action.environment, &digest, true);
+            match state.control.upsert_app(app) {
+                Ok(app) => Json(app).into_response(),
+                Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+            }
+        }
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "app.unknown"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn rollback_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(action): Json<EnvAction>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.get_app(&action.id) {
+        Ok(Some(mut app)) => match rollback_environment(&mut app, &action.environment) {
+            Ok(_) => match state.control.upsert_app(app) {
+                Ok(app) => Json(app).into_response(),
+                Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+            },
+            Err(LoomError::ImageMissing) => {
+                feature_error(StatusCode::CONFLICT, "app.image_missing")
+            }
+            Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "app.invalid"),
+        },
+        Ok(None) => feature_error(StatusCode::NOT_FOUND, "app.unknown"),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn gc_apps(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    feature_error(StatusCode::NOT_IMPLEMENTED, "app.gc_unimplemented")
+}
+
+async fn maintain_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.list_jobs() {
+        Ok(jobs) => Json(MaintainStatus {
+            agent_configured: state.agent.configured(),
+            jobs,
+        })
+        .into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn list_webhooks(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match state.control.list_webhooks() {
+        Ok(hooks) => Json(hooks).into_response(),
+        Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+    }
+}
+
+async fn create_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<WebhookCreate>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match request.into_endpoint() {
+        Ok(hook) => match state.control.upsert_webhook(hook) {
+            Ok(hook) => (StatusCode::CREATED, Json(hook)).into_response(),
+            Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "control.unavailable"),
+        },
+        Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "webhook.invalid"),
+    }
+}
+
+#[derive(Deserialize)]
+struct BackupRequest {
+    destination: String,
+}
+
+async fn create_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BackupRequest>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match backup(&state.store, Path::new(&request.destination)) {
+        Ok(path) => Json(serde_json::json!({ "path": path })).into_response(),
+        Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "backup.failed"),
+    }
+}
+
+async fn restore_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BackupRequest>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    match restore(&state.store, Path::new(&request.destination)) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(_) => feature_error(StatusCode::UNPROCESSABLE_ENTITY, "restore.failed"),
+    }
+}
+
+async fn mcp_manifest(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    Json(serde_json::json!({
+        "name": "loom",
+        "tools": [
+            "repo", "git", "feature", "candidate", "evidence",
+            "events", "token", "project", "app", "maintain"
+        ]
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct McpCall {
+    tool: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+async fn mcp_call(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(call): Json<McpCall>,
+) -> Response {
+    if let Err(response) = require_token(&state, &headers) {
+        return *response;
+    }
+    let _ = (call.tool, call.arguments);
+    feature_error(StatusCode::NOT_IMPLEMENTED, "mcp.call_unimplemented")
+}

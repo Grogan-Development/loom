@@ -5,8 +5,7 @@ use std::fs::{self, File};
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -14,10 +13,10 @@ use uuid::Uuid;
 
 use crate::contracts::{ArtifactDigest, RepositoryBinding, RepositoryRevision};
 use crate::features::{Candidate, EvidenceBundle, candidate_source_key};
-use crate::grid_runner::{CreateRunnerRequest, GridRepo, GridRunner, grid_backend_requested};
+use crate::runner::{LocalProcessRunner, Runner as _};
 use crate::{
     CandidateRevisionStatus, LoomError, NamespaceGrant, PersistentLoomStore, SourceFileMode,
-    digest_bytes, read_bounded, write_atomic,
+    digest_bytes, read_bounded, repository_storage_name, write_atomic,
 };
 
 const MAX_CI_BYTES: u64 = 4 * 1024 * 1024;
@@ -254,11 +253,8 @@ impl CiEngine {
     fn execute(
         &self,
         bindings: &[RepositoryBinding],
-        job_id: &str,
+        _job_id: &str,
     ) -> Result<(bool, String), LoomError> {
-        if grid_backend_requested() {
-            return execute_on_grid(bindings, job_id);
-        }
         let grant = NamespaceGrant::new(
             bindings
                 .iter()
@@ -268,18 +264,21 @@ impl CiEngine {
         let workspace = tempfile::tempdir().map_err(|_| LoomError::StorageUnavailable)?;
         let mut log = String::new();
         let mut all_passed = true;
+        let runner = LocalProcessRunner;
         for binding in bindings {
             let head = binding
                 .head
                 .as_ref()
                 .ok_or(LoomError::InvalidSourceCommit)?;
             let files = self.store.materialize_source(&grant, head)?;
-            let repo_root = workspace.path().join(&binding.base.repository);
+            let repo_root = workspace
+                .path()
+                .join(repository_storage_name(&binding.base.repository));
             fs::create_dir_all(&repo_root).map_err(|_| LoomError::StorageUnavailable)?;
             write_tree(&repo_root, &files)?;
             let (commands, timeout) = pipeline_for(&repo_root);
             for command in commands {
-                let (passed, output) = run_command(&repo_root, &command, timeout)?;
+                let (passed, output) = runner.run(&repo_root, &command, timeout)?;
                 log.push('$');
                 log.push(' ');
                 log.push_str(&command.join(" "));
@@ -335,53 +334,6 @@ impl CiEngine {
     }
 }
 
-fn execute_on_grid(
-    bindings: &[RepositoryBinding],
-    job_id: &str,
-) -> Result<(bool, String), LoomError> {
-    let runner = match GridRunner::from_env() {
-        Ok(runner) => runner,
-        Err(error) => return Ok((false, error.to_string())),
-    };
-    let mut repos = Vec::new();
-    for binding in bindings {
-        let head = binding
-            .head
-            .as_ref()
-            .ok_or(LoomError::InvalidSourceCommit)?;
-        repos.push(GridRepo {
-            repo: head.repository.clone(),
-            revision: head.revision.clone(),
-        });
-    }
-    let timeout_secs = DEFAULT_TIMEOUT_SECS.max(600);
-    let created = match runner.create(&CreateRunnerRequest {
-        job_id: job_id.to_owned(),
-        kind: "ci".to_owned(),
-        repos,
-        timeout_secs,
-        env: BTreeMap::new(),
-        commands: Vec::new(),
-    }) {
-        Ok(created) => created,
-        Err(error) => return Ok((false, error.to_string())),
-    };
-    let finished = match runner.wait(
-        &created.id,
-        Duration::from_secs(timeout_secs.saturating_add(90)),
-    ) {
-        Ok(finished) => finished,
-        Err(error) => return Ok((false, error.to_string())),
-    };
-    let passed = finished.status == "passed";
-    let mut log = finished.log;
-    if let Some(error) = finished.error.filter(|value| !value.is_empty()) {
-        log.push('\n');
-        log.push_str(&error);
-    }
-    Ok((passed, log))
-}
-
 fn write_tree(
     root: &Path,
     files: &BTreeMap<String, crate::MaterializedSourceFile>,
@@ -430,7 +382,7 @@ pub fn execute_command(
     command: &[String],
     timeout: Duration,
 ) -> Result<(bool, String), LoomError> {
-    run_command(cwd, command, timeout)
+    LocalProcessRunner.run(cwd, command, timeout)
 }
 
 pub(crate) fn pipeline_for(root: &Path) -> (Vec<Vec<String>>, Duration) {
@@ -451,6 +403,18 @@ pub(crate) fn pipeline_for(root: &Path) -> (Vec<Vec<String>>, Duration) {
             "--offline".to_owned(),
             "--quiet".to_owned(),
         ]]
+    } else if root.join("go.mod").exists() {
+        vec![vec!["go".to_owned(), "test".to_owned(), "./...".to_owned()]]
+    } else if root.join("pyproject.toml").exists()
+        || root.join("requirements.txt").exists()
+        || root.join("setup.py").exists()
+    {
+        vec![vec![
+            "python".to_owned(),
+            "-m".to_owned(),
+            "unittest".to_owned(),
+            "discover".to_owned(),
+        ]]
     } else if root.join("package.json").exists() {
         vec![vec!["npm".to_owned(), "test".to_owned()]]
     } else {
@@ -461,48 +425,6 @@ pub(crate) fn pipeline_for(root: &Path) -> (Vec<Vec<String>>, Duration) {
         ]]
     };
     (commands, Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-}
-
-pub(crate) fn run_command(
-    cwd: &Path,
-    command: &[String],
-    timeout: Duration,
-) -> Result<(bool, String), LoomError> {
-    let program = command.first().ok_or(LoomError::InvalidSourceCommit)?;
-    if program.contains('/') || program.contains('\\') {
-        return Err(LoomError::InvalidSourceCommit);
-    }
-    let mut child = Command::new(program)
-        .args(&command[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| LoomError::StorageUnavailable)?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stdout);
-                }
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
-                }
-                return Ok((status.success(), format!("{stdout}{stderr}")));
-            }
-            Ok(None) if started.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok((false, "ci.timeout".to_owned()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => return Err(LoomError::StorageUnavailable),
-        }
-    }
 }
 
 pub(crate) fn truncate_log(log: &str) -> String {

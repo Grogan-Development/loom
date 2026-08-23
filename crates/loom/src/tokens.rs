@@ -1,9 +1,9 @@
 //! Scoped access tokens minted by the owner for workspaces, runners, and agents.
 //!
 //! The owner token stays all-powerful (except deploy). Scoped tokens narrow a
-//! bearer to a repository set and a capability set so Grid can hand each
-//! workspace, runner, or review agent its own revocable credential. Secrets
-//! are stored only as SHA-256 hashes in `tokens.json` under the store lock.
+//! bearer to a repository set and a capability set so workspaces, runners, and
+//! agents each get a revocable credential. Secrets are stored only as SHA-256
+//! hashes in `tokens.json` under the store lock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -38,6 +38,8 @@ pub enum TokenPerm {
     Review,
     /// Event stream reads.
     Events,
+    /// Accept and promote `class=maintenance` features only.
+    Maintain,
 }
 
 /// Durable scoped-token record. The secret is stored only as a hash.
@@ -349,6 +351,14 @@ impl Principal {
     #[must_use]
     pub const fn is_owner(&self) -> bool {
         matches!(self, Self::Owner)
+    }
+
+    /// True when this principal may accept a maintenance feature for `repositories`.
+    pub fn allows_maintain<'a>(&self, repositories: impl IntoIterator<Item = &'a str>) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Scoped(_) => self.allows(TokenPerm::Maintain, repositories),
+        }
     }
 }
 

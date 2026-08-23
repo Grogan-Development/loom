@@ -11,6 +11,7 @@ authors = ["Grogan"]
 repository = "https://origin.cursor.com/loom"
 
 [workspace.dependencies]
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc"] }
 axum = "=0.8.9"
 base64ct = { version = "=1.8.3", features = ["alloc"] }
 clap = { version = "=4.6.6", features = ["derive", "env"] }

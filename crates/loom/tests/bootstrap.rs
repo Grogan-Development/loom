@@ -60,7 +60,7 @@ fn fixture() -> Fixture {
         deploy_token: None,
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();

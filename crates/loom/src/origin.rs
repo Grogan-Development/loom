@@ -24,9 +24,6 @@ use crate::{LoomError, PersistentLoomStore, hex_digest, read_bounded, write_atom
 
 const MAX_ORIGIN_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_JOBS: usize = 10_000;
-const DEFAULT_OWNER: &str = "grogan-dev";
-const DEFAULT_CLONE_HOST: &str = "origin.cursor.com";
-const DEFAULT_API_BASE: &str = "https://api.cursor.com/v1/origin";
 const WEBHOOK_SKEW_SECS: u64 = 300;
 
 /// How Origin SHA trees used to be obtained and tested. Kept for config compat.
@@ -126,22 +123,22 @@ impl std::fmt::Debug for OriginConfig {
 }
 
 impl OriginConfig {
-    /// Production defaults for grogan-dev on Origin.
+    /// Production defaults with no Grogan/Origin host baked in.
     #[must_use]
     pub fn production(workdir: PathBuf, git_program: PathBuf) -> Self {
         Self {
-            owner: DEFAULT_OWNER.to_owned(),
-            clone_host: DEFAULT_CLONE_HOST.to_owned(),
-            api_base: DEFAULT_API_BASE.to_owned(),
+            owner: String::new(),
+            clone_host: String::new(),
+            api_base: String::new(),
             clone_token: None,
             app_id: None,
             app_private_key_pem: None,
             installation_id: None,
             git_program,
             workdir,
-            loom_apply: PathBuf::from("/opt/loom/scripts/apply.sh"),
-            grid_apply: PathBuf::from("/opt/grid/scripts/apply.sh"),
-            nero_apply: PathBuf::from("/opt/nero/scripts/apply.sh"),
+            loom_apply: PathBuf::from("/usr/local/sbin/loom-apply"),
+            grid_apply: PathBuf::from("/usr/local/sbin/remote-apply"),
+            nero_apply: PathBuf::from("/usr/local/sbin/remote-apply"),
             deploy_ssh_host: None,
             deploy_ssh_user: Some("root".to_owned()),
             deploy_ssh_key: None,
@@ -158,18 +155,18 @@ impl OriginConfig {
     #[must_use]
     pub fn for_test(workdir: PathBuf, passed: bool) -> Self {
         Self {
-            owner: DEFAULT_OWNER.to_owned(),
-            clone_host: DEFAULT_CLONE_HOST.to_owned(),
-            api_base: DEFAULT_API_BASE.to_owned(),
+            owner: String::new(),
+            clone_host: String::new(),
+            api_base: String::new(),
             clone_token: None,
             app_id: None,
             app_private_key_pem: None,
             installation_id: None,
             git_program: PathBuf::from("/usr/bin/git"),
             workdir,
-            loom_apply: PathBuf::from("/opt/loom/scripts/apply.sh"),
-            grid_apply: PathBuf::from("/opt/grid/scripts/apply.sh"),
-            nero_apply: PathBuf::from("/opt/nero/scripts/apply.sh"),
+            loom_apply: PathBuf::from("/usr/local/sbin/loom-apply"),
+            grid_apply: PathBuf::from("/usr/local/sbin/remote-apply"),
+            nero_apply: PathBuf::from("/usr/local/sbin/remote-apply"),
             deploy_ssh_host: None,
             deploy_ssh_user: None,
             deploy_ssh_key: None,
@@ -473,7 +470,11 @@ impl OriginEngine {
         repository: &str,
         revision: &RepositoryRevision,
     ) -> Option<String> {
-        let directory = self.store.root.join("git-mappings").join(repository);
+        let directory = self
+            .store
+            .root
+            .join("git-mappings")
+            .join(crate::repository_storage_name(repository));
         let entries = std::fs::read_dir(directory).ok()?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -501,7 +502,7 @@ impl OriginEngine {
             .store
             .root
             .join("git-mappings")
-            .join(repository)
+            .join(crate::repository_storage_name(repository))
             .join(format!("{oid}.json"));
         let bytes = read_bounded(&path, 4096).ok()?;
         let mapping = serde_json::from_slice::<GitRevisionMapping>(&bytes).ok()?;
@@ -657,11 +658,10 @@ impl OriginEngine {
     }
 
     fn push_mirror(&self, repository: &str, oid: &str) -> Result<String, LoomError> {
-        let bare = self
-            .store
-            .root
-            .join("git")
-            .join(format!("{repository}.git"));
+        let bare = self.store.root.join("git").join(format!(
+            "{}.git",
+            crate::repository_storage_name(repository)
+        ));
         if !bare.is_dir() {
             return Err(LoomError::OriginUnavailable);
         }

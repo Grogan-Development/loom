@@ -32,7 +32,7 @@ fn test_app() -> (tempfile::TempDir, axum::Router) {
         deploy_token: None,
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();
@@ -139,7 +139,7 @@ fn git_import_emits_push_received_after_cas_completion() {
     let bridge = GitBridge::new(
         store.clone(),
         Path::new("/usr/bin/git"),
-        Path::new("/bin/true"),
+        Path::new("/usr/bin/true"),
     )
     .unwrap();
     let bare = bridge.ensure_repository("demo").unwrap();

@@ -1,10 +1,9 @@
-//! Typed, durable repository catalog replacing hardcoded allowlists.
+//! Typed, durable repository catalog.
 //!
-//! The catalog lives in `repos.json` under the store lock. Until the file is
-//! seeded, readers see the in-memory defaults derived from [`OriginConfig`]
-//! so standalone engines behave exactly like today's hardcoded allowlist.
-//! [`RepoCatalog::ensure_seeded`] persists those defaults on first server
-//! start; afterwards the owner CRUD API is the single source of truth.
+//! The catalog lives in `repos.json` under the store lock. First start writes
+//! an empty catalog ([`seed_entries`]); afterwards the owner CRUD API is the
+//! single source of truth. Repository names may be a legacy identifier or
+//! `project/repo`.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -286,53 +285,12 @@ impl RepoCatalog {
     }
 }
 
-/// Seed entries matching today's hardcoded behavior exactly: `loom` applies
-/// locally, `grid` and `nero` apply over SSH to the configured deploy host,
-/// and `console` is registered without a deploy target yet.
+/// Catalog defaults. Grogan platform siblings are not seeded; an empty
+/// catalog is the standalone product. `config` is unused and kept so call
+/// sites that pass Origin apply paths still compile during the disconnect.
 #[must_use]
-pub fn seed_entries(config: &OriginConfig) -> Vec<RepoEntry> {
-    vec![
-        RepoEntry {
-            name: "loom".to_owned(),
-            protected_ref: DEFAULT_PROTECTED_REF.to_owned(),
-            checkout_path: Some(PathBuf::from("/opt/loom")),
-            ci: CiPolicy::LoomCi,
-            deploy_target: DeployTarget::LocalApply {
-                script: config.loom_apply.clone(),
-            },
-            description: "Loom smart repository service (this host)".to_owned(),
-        },
-        RepoEntry {
-            name: "grid".to_owned(),
-            protected_ref: DEFAULT_PROTECTED_REF.to_owned(),
-            checkout_path: Some(PathBuf::from("/opt/grid")),
-            ci: CiPolicy::LoomCi,
-            deploy_target: DeployTarget::SshApply {
-                host: None,
-                script: config.grid_apply.clone(),
-            },
-            description: "Grid workspace control plane (workstation host)".to_owned(),
-        },
-        RepoEntry {
-            name: "nero".to_owned(),
-            protected_ref: DEFAULT_PROTECTED_REF.to_owned(),
-            checkout_path: Some(PathBuf::from("/opt/nero")),
-            ci: CiPolicy::LoomCi,
-            deploy_target: DeployTarget::SshApply {
-                host: None,
-                script: config.nero_apply.clone(),
-            },
-            description: "Nero agent service (workstation host)".to_owned(),
-        },
-        RepoEntry {
-            name: "console".to_owned(),
-            protected_ref: DEFAULT_PROTECTED_REF.to_owned(),
-            checkout_path: None,
-            ci: CiPolicy::LoomCi,
-            deploy_target: DeployTarget::None,
-            description: "Platform console (no deploy target yet)".to_owned(),
-        },
-    ]
+pub fn seed_entries(_config: &OriginConfig) -> Vec<RepoEntry> {
+    Vec::new()
 }
 
 fn validate_entry(entry: &RepoEntry) -> Result<(), LoomError> {

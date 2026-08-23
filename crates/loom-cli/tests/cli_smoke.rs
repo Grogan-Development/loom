@@ -48,7 +48,7 @@ fn test_app() -> (tempfile::TempDir, axum::Router, String, String) {
         deploy_token: None,
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();
@@ -56,7 +56,7 @@ fn test_app() -> (tempfile::TempDir, axum::Router, String, String) {
 }
 
 fn loom_cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_loom-cli"))
+    Command::new(env!("CARGO_BIN_EXE_loom"))
 }
 
 fn write_json(directory: &tempfile::TempDir, name: &str, value: &serde_json::Value) -> PathBuf {
@@ -119,7 +119,6 @@ fn documented_command_shapes_parse_and_use_the_stable_name() {
     assert!(ok, "top-level help should succeed: {top_level}");
     assert!(top_level.contains("Usage: loom <COMMAND>"), "{top_level}");
 
-    // These are the high-value command forms baked into Grid's Nero skills.
     // Appending --help validates Clap's exact option/argument grammar without
     // requiring credentials or making an HTTP request.
     let cases: &[&[&str]] = &[
@@ -144,6 +143,13 @@ fn documented_command_shapes_parse_and_use_the_stable_name() {
         &["comment", "--feature", "feature-id", "--body", "looks good"],
         &["events", "--follow", "--feature", "feature-id"],
         &["status"],
+        &["repo", "list"],
+        &["repo", "import", "--project", "billing", "--name", "api"],
+        &["project", "list"],
+        &["app", "list"],
+        &["maintain", "status"],
+        &["mcp"],
+        &["login", "--url", "http://127.0.0.1:8080", "--token", "x"],
     ];
     for args in cases {
         let (ok, text) = run_help(args);

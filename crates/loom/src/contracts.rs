@@ -61,9 +61,9 @@ impl RepositoryRevision {
     /// Returns every repository and digest syntax violation.
     pub fn validate(&self) -> Result<(), ValidationError> {
         let mut violations = Vec::new();
-        if !safe_artifact_identifier(&self.repository) {
+        if crate::validate_repository(&self.repository).is_err() {
             violations.push(
-                "repository name must be 1-128 ASCII letters, digits, dots, dashes, or underscores"
+                "repository name must be a legacy identifier or project/repo with one slash"
                     .to_owned(),
             );
         }
@@ -176,11 +176,4 @@ pub(crate) fn is_sha256_hex(value: &str) -> bool {
             .as_bytes()
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-}
-
-fn safe_artifact_identifier(value: &str) -> bool {
-    (1..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }

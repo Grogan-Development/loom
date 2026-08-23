@@ -105,7 +105,7 @@ fn test_app(root: PathBuf) -> axum::Router {
         deploy_token: None,
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
-        hook_program: PathBuf::from("/bin/true"),
+        hook_program: PathBuf::from("/usr/bin/true"),
         review_runner: None,
     })
     .unwrap();
@@ -162,6 +162,9 @@ async fn insights_get_after_candidate_submit() {
                 then: "insights exist".to_owned(),
             }],
             evidence_policy: EvidencePolicy::minimum(),
+            class: loom::features::FeatureClass::Product,
+            subclass: None,
+            fingerprint: None,
         })
         .unwrap();
     features.approve(&feature.id).unwrap();

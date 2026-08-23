@@ -1,20 +1,36 @@
 //! Loom content-addressed source, refs, atomic promotion, features, and CI.
 
+pub mod admission;
+pub mod agent;
+pub mod app;
 pub mod auth;
+pub mod backup;
+pub mod caddy;
 pub mod catalog;
 pub mod ci;
 pub mod contracts;
+pub mod control;
+pub mod dashboard;
 pub mod deploy;
+pub mod docker_runner;
 pub mod events;
 pub mod features;
 pub mod git;
 pub mod grid_runner;
+pub mod import;
 pub mod insights; // insights-slice
+pub mod maintain;
 pub mod origin;
+pub mod pack;
+pub mod project;
 pub mod review;
 pub mod review_runner;
+pub mod runner;
+pub mod search;
+pub mod secrets;
 pub mod server;
 pub mod tokens;
+pub mod webhook;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -111,9 +127,6 @@ pub enum LoomError {
         /// Rejected repository namespace.
         repository: String,
     },
-    /// Plaintext Loom RPC may bind only to loopback behind the Data VM mTLS proxy.
-    #[error("Loom RPC bind must be loopback")]
-    InvalidRpcBind,
     /// Revision-scoped software graph does not satisfy the bounded v1 contract.
     #[error("software graph is invalid")]
     InvalidSoftwareGraph,
@@ -184,6 +197,30 @@ pub enum LoomError {
         /// Requested token id.
         id: String,
     },
+    /// Control-plane object is missing.
+    #[error("unknown project: {name}")]
+    UnknownProject {
+        /// Requested project name.
+        name: String,
+    },
+    /// Project or service identifier failed its contract.
+    #[error("control request is invalid")]
+    InvalidControl,
+    /// Required control-plane store is unavailable.
+    #[error("control plane is unavailable")]
+    ControlUnavailable,
+    /// Planner credentials are missing.
+    #[error("maintain agent is unconfigured")]
+    AgentUnconfigured,
+    /// Deploy image digest is missing from the local docker daemon.
+    #[error("deploy image is missing")]
+    ImageMissing,
+    /// Host disk is below the CI admission threshold.
+    #[error("host disk is below the CI threshold")]
+    DiskFull,
+    /// Host memory/CPU admission refused the job.
+    #[error("host capacity is exhausted")]
+    CapacityExhausted,
 }
 
 /// Repository namespace set attached to one authorized request.
@@ -1533,7 +1570,9 @@ impl PersistentLoomStore {
         validate_software_graph(&graph)?;
         let lock = self.exclusive_lock()?;
         self.ensure_persistent_revision(&graph.revision.repository, &graph.revision)?;
-        let directory = self.graphs.join(&graph.revision.repository);
+        let directory = self
+            .graphs
+            .join(repository_storage_name(&graph.revision.repository));
         ensure_private_directory(&directory)?;
         let path = directory.join(format!("{}.json", graph.revision.revision));
         let bytes = serde_json::to_vec(&graph).map_err(|_| LoomError::Serialization)?;
@@ -1572,7 +1611,7 @@ impl PersistentLoomStore {
         self.ensure_persistent_revision(&revision.repository, revision)?;
         let path = self
             .graphs
-            .join(&revision.repository)
+            .join(repository_storage_name(&revision.repository))
             .join(format!("{}.json", revision.revision));
         let bytes = read_bounded(&path, MAX_GRAPH_BYTES)?;
         let graph: SoftwareGraph =
@@ -1758,7 +1797,9 @@ impl PersistentLoomStore {
         revision: &RepositoryRevision,
         snapshot: &Snapshot,
     ) -> Result<(), LoomError> {
-        let directory = self.snapshots.join(&revision.repository);
+        let directory = self
+            .snapshots
+            .join(repository_storage_name(&revision.repository));
         ensure_private_directory(&directory)?;
         let path = directory.join(format!("{}.json", revision.revision));
         let bytes = serde_json::to_vec(snapshot).map_err(|_| LoomError::Serialization)?;
@@ -1779,7 +1820,7 @@ impl PersistentLoomStore {
         validate_repository(&revision.repository)?;
         let path = self
             .snapshots
-            .join(&revision.repository)
+            .join(repository_storage_name(&revision.repository))
             .join(format!("{}.json", revision.revision));
         let bytes = read_bounded(&path, MAX_SNAPSHOT_BYTES).map_err(|error| match error {
             LoomError::StorageUnavailable if !path.exists() => unknown_revision(revision),
@@ -2116,7 +2157,7 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, LoomError> {
     Ok(bytes)
 }
 
-fn write_atomic(
+pub(crate) fn write_atomic(
     directory: &Path,
     destination: &Path,
     bytes: &[u8],
@@ -2155,12 +2196,40 @@ fn authorize(grant: &NamespaceGrant, repository: &str) -> Result<(), LoomError> 
     }
 }
 
-fn validate_repository(repository: &str) -> Result<(), LoomError> {
-    if (1..=128).contains(&repository.len())
-        && repository
+/// Encodes a repository namespace as a single filesystem path component.
+///
+/// A catalog name may contain one `/` (`project/repo`). Snapshots, graphs, and
+/// Git mappings must not nest extra directories for that slash.
+#[must_use]
+pub fn repository_storage_name(repository: &str) -> String {
+    repository.replace('%', "%25").replace('/', "%2F")
+}
+
+fn is_legacy_repository_segment(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && !value.contains('/')
+        && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+}
+
+fn is_project_repo_segment(value: &str) -> bool {
+    (1..=63).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+pub(crate) fn validate_repository(repository: &str) -> Result<(), LoomError> {
+    let valid = (1..=128).contains(&repository.len())
+        && (is_legacy_repository_segment(repository)
+            || repository.split_once('/').is_some_and(|(project, name)| {
+                !name.contains('/')
+                    && is_project_repo_segment(project)
+                    && is_project_repo_segment(name)
+            }));
+    if valid {
         Ok(())
     } else {
         Err(LoomError::InvalidRepository {
@@ -2169,7 +2238,7 @@ fn validate_repository(repository: &str) -> Result<(), LoomError> {
     }
 }
 
-fn validate_path(path: &str) -> Result<(), LoomError> {
+pub(crate) fn validate_path(path: &str) -> Result<(), LoomError> {
     let value = Path::new(path);
     let mut normalized = PathBuf::new();
     for component in value.components() {
@@ -2292,7 +2361,7 @@ fn revision_for(repository: &str, snapshot: &Snapshot) -> Result<RepositoryRevis
         .map_err(|_| LoomError::Serialization)
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     let alphabet = b"0123456789abcdef";
     bytes
         .iter()

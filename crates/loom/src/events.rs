@@ -7,7 +7,7 @@
 //! `deploy.applied` follows a successful release apply.
 //!
 //! Known kinds: `push.received`, `feature.created`, `feature.approved`,
-//! `feature.accepted`, `feature.rejected`, `candidate.submitted`,
+//! `feature.auto_approved`, `feature.accepted`, `feature.rejected`, `candidate.submitted`,
 //! `ci.started`, `ci.finished`, `insights.ready`, `review.started`,
 //! `review.finding`, `review.completed`, `comment.added`, `refs.moved`,
 //! `refs.bootstrapped`, `deploy.applied`.

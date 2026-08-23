@@ -1,21 +1,58 @@
 services:
-  loom:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - loomd
+    networks:
+      - loom
+
+  surreal:
+    image: surrealdb/surrealdb:latest
+    restart: unless-stopped
+    command: start --log info --user ${SURREAL_USER:-loom} --pass ${SURREAL_PASS:?set SURREAL_PASS} surrealkv:/data
+    volumes:
+      - surreal-data:/data
+    networks:
+      - loom-control
+
+  loomd:
     build: .
     image: loom:local
     restart: unless-stopped
     environment:
       LOOM_TOKEN: ${LOOM_TOKEN:?set LOOM_TOKEN}
+      LOOM_DEPLOY_TOKEN: ${LOOM_DEPLOY_TOKEN:-}
+      LOOM_SECRETS_KEY: ${LOOM_SECRETS_KEY:-}
+      LOOM_AGENT_API_KEY: ${LOOM_AGENT_API_KEY:-}
+      LOOM_AGENT_MODEL: ${LOOM_AGENT_MODEL:-claude-opus-4-6}
+      LOOM_BASE_DOMAIN: ${LOOM_BASE_DOMAIN:-apps.grogan.dev}
       LOOM_BIND: 0.0.0.0:8080
       LOOM_ROOT: /data/loom
-    ports:
-      - "8080:8080"
     volumes:
       - loom-data:/data/loom
     healthcheck:
-      test: ["CMD", "sh", "-c", "command -v loom"]
+      test: ["CMD", "sh", "-c", "command -v loomd"]
       interval: 30s
       timeout: 5s
       retries: 3
+    networks:
+      - loom
+      - loom-control
+
+networks:
+  loom:
+    name: loom-apps
+  loom-control:
+    internal: true
 
 volumes:
   loom-data:
+  caddy-data:
+  surreal-data:
