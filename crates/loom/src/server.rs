@@ -529,11 +529,27 @@ async fn revoke_token(
 }
 
 async fn list_repos(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(response) = require_token(&state, &headers) {
-        return *response;
-    }
+    let principal = match resolve_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     match state.catalog.list() {
-        Ok(entries) => Json(entries).into_response(),
+        // Scoped tokens see only the repositories their grant covers; the
+        // owner sees everything. Repo discovery must work for the git
+        // customers (workspaces) that hold scoped tokens.
+        Ok(entries) => {
+            let visible = entries
+                .into_iter()
+                .filter(|entry| match &principal {
+                    Principal::Owner => true,
+                    Principal::Scoped(token) => {
+                        token.perms.contains(&TokenPerm::Git)
+                            && token.repositories.contains(entry.name.as_str())
+                    }
+                })
+                .collect::<Vec<_>>();
+            Json(visible).into_response()
+        }
         Err(_) => feature_error(StatusCode::SERVICE_UNAVAILABLE, "loom.storage_unavailable"),
     }
 }
