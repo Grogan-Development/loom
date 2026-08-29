@@ -28,17 +28,6 @@ pub enum FeatureGate {
     Rejected,
 }
 
-/// Who may create and promote a feature.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FeatureClass {
-    /// Human product work. Gate 1 is owner-only.
-    #[default]
-    Product,
-    /// Scheduler-created maintenance. Born approved; Gate 2 needs `maintain`.
-    Maintenance,
-}
-
 /// Human-observable behavior a feature must satisfy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,8 +97,11 @@ pub struct Candidate {
 }
 
 /// Owner-approved execution contract that replaces a pull request.
+///
+/// Older stores serialized optional maintenance-bookkeeping fields
+/// (`class`, `subclass`, `fingerprint`); those are ignored on load and no
+/// longer written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Feature {
     /// Contract schema version.
     pub schema_version: String,
@@ -129,15 +121,6 @@ pub struct Feature {
     pub candidate: Option<Candidate>,
     /// Exact reverse CAS captured at promotion.
     pub rollback: Option<Vec<RefCasUpdate>>,
-    /// Product vs maintenance. Missing records deserialize as product.
-    #[serde(default)]
-    pub class: FeatureClass,
-    /// Maintenance subclass (`deps`, `security`, `runtime`, …).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subclass: Option<String>,
-    /// Dedup key for one open maintenance feature per (repo, subclass, fingerprint).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
 }
 
 /// Create-feature request.
@@ -153,15 +136,6 @@ pub struct FeatureCreate {
     /// Evidence required for Gate 2.
     #[serde(default = "EvidencePolicy::minimum")]
     pub evidence_policy: EvidencePolicy,
-    /// Product (default) or maintenance. HTTP callers cannot mint maintenance.
-    #[serde(default)]
-    pub class: FeatureClass,
-    /// Maintenance subclass. Required with maintenance class on the store path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subclass: Option<String>,
-    /// Dedup fingerprint for the maintain queue.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
 }
 
 /// Submit a candidate against an approved feature.
@@ -204,21 +178,7 @@ impl FeatureStore {
     ///
     /// Returns for empty titles, invalid refs, or durable I/O failure.
     pub fn create(&self, request: FeatureCreate) -> Result<Feature, LoomError> {
-        self.create_with_authority(request, false)
-    }
-
-    /// Creates a feature. `scheduler` may mint `class=maintenance` (born approved).
-    ///
-    /// # Errors
-    ///
-    /// Returns for empty titles, invalid refs, spoofed maintenance class, or I/O failure.
-    pub fn create_with_authority(
-        &self,
-        request: FeatureCreate,
-        scheduler: bool,
-    ) -> Result<Feature, LoomError> {
-        validate_create(&request, scheduler)?;
-        let maintenance = request.class == FeatureClass::Maintenance;
+        validate_create(&request)?;
         let feature = Feature {
             schema_version: "v1".to_owned(),
             id: Uuid::now_v7().to_string(),
@@ -226,16 +186,9 @@ impl FeatureStore {
             repositories: request.repositories,
             scenarios: request.scenarios,
             evidence_policy: request.evidence_policy,
-            gate: if maintenance {
-                FeatureGate::Approved
-            } else {
-                FeatureGate::Draft
-            },
+            gate: FeatureGate::Draft,
             candidate: None,
             rollback: None,
-            class: request.class,
-            subclass: request.subclass,
-            fingerprint: request.fingerprint,
         };
         let lock = self.store.exclusive_lock()?;
         let mut features = self.load()?;
@@ -435,23 +388,7 @@ impl FeatureStore {
     }
 }
 
-fn validate_create(request: &FeatureCreate, scheduler: bool) -> Result<(), LoomError> {
-    if request.class == FeatureClass::Maintenance {
-        if !scheduler {
-            return Err(LoomError::InvalidSourceCommit);
-        }
-        let subclass = request.subclass.as_deref().unwrap_or("").trim();
-        let fingerprint = request.fingerprint.as_deref().unwrap_or("").trim();
-        if subclass.is_empty()
-            || subclass.len() > 64
-            || fingerprint.is_empty()
-            || fingerprint.len() > 256
-        {
-            return Err(LoomError::InvalidSourceCommit);
-        }
-    } else if request.subclass.is_some() || request.fingerprint.is_some() {
-        return Err(LoomError::InvalidSourceCommit);
-    }
+fn validate_create(request: &FeatureCreate) -> Result<(), LoomError> {
     if request.title.trim().is_empty() {
         return Err(LoomError::InvalidSourceCommit);
     }

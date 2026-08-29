@@ -1,8 +1,8 @@
-//! Scoped access tokens minted by the owner for workspaces, runners, and agents.
+//! Scoped access tokens minted by the owner.
 //!
 //! The owner token stays all-powerful (except deploy). Scoped tokens narrow a
-//! bearer to a repository set and a capability set so workspaces, runners, and
-//! agents each get a revocable credential. Secrets are stored only as SHA-256
+//! bearer to a repository set and a capability set so CI jobs, reviewers, and
+//! mirrors each get a revocable credential. Secrets are stored only as SHA-256
 //! hashes in `tokens.json` under the store lock.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,8 +38,21 @@ pub enum TokenPerm {
     Review,
     /// Event stream reads.
     Events,
-    /// Accept and promote `class=maintenance` features only.
-    Maintain,
+}
+
+/// Deserializes a persisted perm set, silently dropping capability names this
+/// build no longer knows (e.g. the removed `maintain` perm on older stores).
+fn deserialize_perms<'de, D>(deserializer: D) -> Result<BTreeSet<TokenPerm>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let names = Vec::<String>::deserialize(deserializer)?;
+    Ok(names
+        .into_iter()
+        .filter_map(|name| {
+            serde_json::from_value::<TokenPerm>(serde_json::Value::String(name)).ok()
+        })
+        .collect())
 }
 
 /// Durable scoped-token record. The secret is stored only as a hash.
@@ -55,6 +68,7 @@ pub struct ScopedToken {
     /// Repository namespaces this token may touch.
     pub repositories: BTreeSet<String>,
     /// Capabilities granted on those repositories.
+    #[serde(deserialize_with = "deserialize_perms")]
     pub perms: BTreeSet<TokenPerm>,
     /// Optional feature binding for an automated review job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -351,14 +365,6 @@ impl Principal {
     #[must_use]
     pub const fn is_owner(&self) -> bool {
         matches!(self, Self::Owner)
-    }
-
-    /// True when this principal may accept a maintenance feature for `repositories`.
-    pub fn allows_maintain<'a>(&self, repositories: impl IntoIterator<Item = &'a str>) -> bool {
-        match self {
-            Self::Owner => true,
-            Self::Scoped(_) => self.allows(TokenPerm::Maintain, repositories),
-        }
     }
 }
 

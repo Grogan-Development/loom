@@ -89,23 +89,11 @@ enum Command {
         #[command(subcommand)]
         action: ProjectAction,
     },
-    /// Apps / services.
-    App {
-        #[command(subcommand)]
-        action: AppAction,
-    },
-    /// Maintain queue.
-    Maintain {
-        #[command(subcommand)]
-        action: MaintainAction,
-    },
     /// Dump a backup tarball.
     Backup {
         /// Destination path.
         destination: PathBuf,
     },
-    /// Print the MCP tool list. HTTP MCP calls are 501.
-    Mcp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,10 +105,6 @@ enum RepoAction {
         #[arg(long)]
         name: String,
         git_url: Option<String>,
-        #[arg(long)]
-        no_app: bool,
-        #[arg(long)]
-        no_maintain: bool,
     },
     /// GET `/v1/repos`.
     List,
@@ -136,36 +120,6 @@ enum ProjectAction {
     List,
     /// GET `/v1/projects/{name}`.
     Show { name: String },
-    /// POST `/v1/projects/{name}/pause`.
-    Pause { name: String },
-    /// POST `/v1/projects/{name}/pause` with paused=false.
-    Resume { name: String },
-}
-
-#[derive(Debug, Subcommand)]
-enum AppAction {
-    /// GET `/v1/apps`.
-    List,
-    /// GET `/v1/apps/{id}`.
-    Show { id: String },
-    /// POST `/v1/apps/{id}/promote`.
-    Promote {
-        id: String,
-        #[arg(long, default_value = "production")]
-        environment: String,
-    },
-    /// POST `/v1/apps/{id}/rollback`.
-    Rollback {
-        id: String,
-        #[arg(long, default_value = "production")]
-        environment: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum MaintainAction {
-    /// GET `/v1/maintain`.
-    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,23 +187,13 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    match &cli.command {
-        Command::Login { url, token } => return write_credentials(url, token),
-        Command::Mcp => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "tools": ["repo","git","feature","candidate","evidence","events","token","project","app","maintain"]
-                })
-            );
-            return Ok(());
-        }
-        _ => {}
+    if let Command::Login { url, token } = &cli.command {
+        return write_credentials(url, token);
     }
     let api = Api::from_env()?;
-    #[allow(unreachable_patterns)]
     match cli.command {
         Command::Events {
             follow,
@@ -335,8 +279,6 @@ async fn run() -> Result<(), String> {
                 project,
                 name,
                 git_url,
-                no_app,
-                no_maintain,
             } => {
                 api.send(
                     Method::POST,
@@ -345,8 +287,6 @@ async fn run() -> Result<(), String> {
                         "project": project,
                         "name": name,
                         "git_url": git_url.unwrap_or_default(),
-                        "app": !no_app,
-                        "maintain": !no_maintain,
                     })),
                 )
                 .await
@@ -367,45 +307,6 @@ async fn run() -> Result<(), String> {
                 api.send(Method::GET, &format!("/v1/projects/{name}"), None)
                     .await
             }
-            ProjectAction::Pause { name } => {
-                api.send(
-                    Method::POST,
-                    &format!("/v1/projects/{name}/pause"),
-                    Some(json!({ "paused": true })),
-                )
-                .await
-            }
-            ProjectAction::Resume { name } => {
-                api.send(
-                    Method::POST,
-                    &format!("/v1/projects/{name}/pause"),
-                    Some(json!({ "paused": false })),
-                )
-                .await
-            }
-        },
-        Command::App { action } => match action {
-            AppAction::List => api.send(Method::GET, "/v1/apps", None).await,
-            AppAction::Show { id } => api.send(Method::GET, &format!("/v1/apps/{id}"), None).await,
-            AppAction::Promote { id, environment } => {
-                api.send(
-                    Method::POST,
-                    "/v1/apps/promote",
-                    Some(json!({ "id": id, "environment": environment })),
-                )
-                .await
-            }
-            AppAction::Rollback { id, environment } => {
-                api.send(
-                    Method::POST,
-                    "/v1/apps/rollback",
-                    Some(json!({ "id": id, "environment": environment })),
-                )
-                .await
-            }
-        },
-        Command::Maintain { action } => match action {
-            MaintainAction::Status => api.send(Method::GET, "/v1/maintain", None).await,
         },
         Command::Backup { destination } => {
             api.send(
@@ -415,9 +316,7 @@ async fn run() -> Result<(), String> {
             )
             .await
         }
-        Command::Login { .. } | Command::Mcp => {
-            Err("internal: login/mcp handled before HTTP client".to_owned())
-        }
+        Command::Login { .. } => Err("internal: login handled before HTTP client".to_owned()),
     }
 }
 
@@ -437,25 +336,16 @@ fn credentials_path() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".config/loom/credentials"))
 }
 
+#[derive(Debug, Default)]
 struct FileCredentials {
     url: Option<String>,
     token: Option<String>,
 }
 
-impl Default for FileCredentials {
-    fn default() -> Self {
-        Self {
-            url: None,
-            token: None,
-        }
-    }
-}
-
 fn read_credentials() -> Result<FileCredentials, String> {
     let path = credentials_path()?;
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(_) => return Ok(FileCredentials::default()),
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(FileCredentials::default());
     };
     let mut file = FileCredentials::default();
     for line in raw.lines() {
@@ -471,10 +361,12 @@ fn read_credentials() -> Result<FileCredentials, String> {
 fn env_or_file(var: &str, file: Option<&str>) -> Result<String, String> {
     match std::env::var(var) {
         Ok(value) if !value.is_empty() => Ok(value),
-        Ok(_) | Err(_) => file
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| format!("{var} is required")),
+        Ok(_) | Err(_) => {
+            let Some(value) = file.filter(|value| !value.is_empty()) else {
+                return Err(format!("{var} is required"));
+            };
+            Ok(value.to_owned())
+        }
     }
 }
 
@@ -748,6 +640,7 @@ fn http_error(status: StatusCode, text: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{comment_body, env_or_file, insights_pointer, review_apply_path};
     use serde_json::json;

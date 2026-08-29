@@ -53,7 +53,6 @@ fn test_app(passed: bool, webhook_secret: Option<[u8; 32]>) -> (tempfile::TempDi
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/usr/bin/true"),
-        review_runner: None,
     })
     .unwrap();
     (directory, app.router())
@@ -286,7 +285,6 @@ async fn loom_release_record_allows_deploy_token_to_apply() {
         origin: OriginConfig::for_test(directory.path().join("origin-work"), true),
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/usr/bin/true"),
-        review_runner: None,
     })
     .unwrap();
     let router = app.router();
@@ -394,7 +392,6 @@ async fn ci_route_executes_pipeline_and_records_honest_results() {
         origin: OriginConfig::for_test(directory.path().join("origin-work"), true),
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/usr/bin/true"),
-        review_runner: None,
     })
     .unwrap();
     let router = app.router();

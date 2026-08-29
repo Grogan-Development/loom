@@ -56,7 +56,6 @@ fn test_app() -> (tempfile::TempDir, PathBuf, axum::Router) {
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/usr/bin/true"),
-        review_runner: None,
     })
     .unwrap();
     (directory, root, app.router())
@@ -124,9 +123,6 @@ fn seed_feature(root: &Path) -> (PersistentLoomStore, NamespaceGrant, String) {
                 then: "findings can be applied".to_owned(),
             }],
             evidence_policy: EvidencePolicy::minimum(),
-            class: loom::features::FeatureClass::Product,
-            subclass: None,
-            fingerprint: None,
         })
         .unwrap();
     features.approve(&feature.id).unwrap();
@@ -695,9 +691,6 @@ async fn automated_review_token_is_bound_to_one_feature_and_review() {
                 then: "the other feature remains inaccessible".to_owned(),
             }],
             evidence_policy: EvidencePolicy::minimum(),
-            class: loom::features::FeatureClass::Product,
-            subclass: None,
-            fingerprint: None,
         })
         .unwrap();
 

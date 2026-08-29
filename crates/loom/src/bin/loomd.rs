@@ -7,7 +7,6 @@ use std::time::Duration;
 use clap::Parser;
 use loom::auth::AccessToken;
 use loom::origin::OriginConfig;
-use loom::review_runner::ReviewRunnerConfig;
 use loom::server::{LoomApp, ServerConfig};
 
 #[derive(Debug, Parser)]
@@ -94,24 +93,6 @@ struct Cli {
     /// `{owner}` / `{repo}` are substituted; a bare host uses `https://{host}/{owner}/{repo}.git`.
     #[arg(long, env = "ORIGIN_MIRROR_REMOTE")]
     origin_mirror_remote: Option<String>,
-    /// Candidate review backend. Set to `grid` to enable asynchronous review Nero.
-    #[arg(long, env = "LOOM_REVIEW_BACKEND")]
-    review_backend: Option<String>,
-    /// Loom URL reachable from Grid runner VMs.
-    #[arg(long, env = "LOOM_PUBLIC_URL")]
-    public_url: Option<String>,
-    /// Grid internal API base used for CI and review runners.
-    #[arg(long, env = "LOOM_GRID_URL")]
-    grid_url: Option<String>,
-    /// Grid internal runner credential.
-    #[arg(long, env = "LOOM_GRID_INTERNAL_TOKEN")]
-    grid_internal_token: Option<String>,
-    /// JSON argv for review Nero (for example `["nero","--single","Review FEATURE_ID"]`).
-    #[arg(long, env = "LOOM_REVIEW_COMMAND_JSON")]
-    review_command_json: Option<String>,
-    /// Wall-clock timeout for a review Nero runner.
-    #[arg(long, env = "LOOM_REVIEW_TIMEOUT_SECS", default_value_t = 900)]
-    review_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -126,7 +107,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.token.is_empty() {
         return Err("LOOM_TOKEN is required".into());
     }
-    let review_runner = review_runner_config(&cli)?;
     let origin = origin_config(&cli)?;
     let deploy_token = cli
         .deploy_token
@@ -140,42 +120,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         origin,
         git_program: cli.git_program,
         hook_program: cli.hook_program,
-        review_runner,
     })?;
     let listener = tokio::net::TcpListener::bind(app.bind()).await?;
     axum::serve(listener, app.router())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
-}
-
-fn review_runner_config(
-    cli: &Cli,
-) -> Result<Option<ReviewRunnerConfig>, Box<dyn std::error::Error>> {
-    let Some(backend) = non_empty(cli.review_backend.as_ref()) else {
-        return Ok(None);
-    };
-    if !backend.eq_ignore_ascii_case("grid") {
-        return Err("LOOM_REVIEW_BACKEND must be grid when set".into());
-    }
-    let public_url =
-        non_empty(cli.public_url.as_ref()).ok_or("LOOM_PUBLIC_URL is required for Grid reviews")?;
-    let grid_url =
-        non_empty(cli.grid_url.as_ref()).ok_or("LOOM_GRID_URL is required for Grid reviews")?;
-    let grid_token = non_empty(cli.grid_internal_token.as_ref())
-        .ok_or("LOOM_GRID_INTERNAL_TOKEN is required for Grid reviews")?;
-    let command_json = non_empty(cli.review_command_json.as_ref())
-        .ok_or("LOOM_REVIEW_COMMAND_JSON is required for Grid reviews")?;
-    let command = serde_json::from_str::<Vec<String>>(command_json)
-        .map_err(|_| "LOOM_REVIEW_COMMAND_JSON must be a JSON argv")?;
-    let config = ReviewRunnerConfig::new(
-        grid_url,
-        grid_token,
-        public_url,
-        command,
-        cli.review_timeout_secs,
-    )?;
-    Ok(Some(config))
 }
 
 /// Empty environment values (e.g. `ORIGIN_APP_ID=` in an `EnvironmentFile`)

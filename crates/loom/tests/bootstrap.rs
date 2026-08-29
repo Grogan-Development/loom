@@ -61,7 +61,6 @@ fn fixture() -> Fixture {
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/usr/bin/true"),
-        review_runner: None,
     })
     .unwrap();
     Fixture {

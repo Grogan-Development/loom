@@ -1,36 +1,23 @@
 //! Loom content-addressed source, refs, atomic promotion, features, and CI.
 
-pub mod admission;
-pub mod agent;
-pub mod app;
 pub mod auth;
 pub mod backup;
-pub mod caddy;
 pub mod catalog;
 pub mod ci;
 pub mod contracts;
-pub mod control;
-pub mod dashboard;
 pub mod deploy;
-pub mod docker_runner;
 pub mod events;
 pub mod features;
 pub mod git;
-pub mod grid_runner;
 pub mod import;
 pub mod insights; // insights-slice
-pub mod maintain;
 pub mod origin;
-pub mod pack;
 pub mod project;
 pub mod review;
-pub mod review_runner;
 pub mod runner;
 pub mod search;
-pub mod secrets;
 pub mod server;
 pub mod tokens;
-pub mod webhook;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -209,18 +196,6 @@ pub enum LoomError {
     /// Required control-plane store is unavailable.
     #[error("control plane is unavailable")]
     ControlUnavailable,
-    /// Planner credentials are missing.
-    #[error("maintain agent is unconfigured")]
-    AgentUnconfigured,
-    /// Deploy image digest is missing from the local docker daemon.
-    #[error("deploy image is missing")]
-    ImageMissing,
-    /// Host disk is below the CI admission threshold.
-    #[error("host disk is below the CI threshold")]
-    DiskFull,
-    /// Host memory/CPU admission refused the job.
-    #[error("host capacity is exhausted")]
-    CapacityExhausted,
 }
 
 /// Repository namespace set attached to one authorized request.

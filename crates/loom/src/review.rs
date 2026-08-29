@@ -44,8 +44,11 @@ pub enum ReviewVerdict {
 }
 
 /// One review attached to a feature candidate.
+///
+/// Older stores serialized a `runner_job_id` field for automatically
+/// dispatched Grid reviews; that field is ignored on load and no longer
+/// written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Review {
     /// Durable review identifier (UUID v7).
     pub id: String,
@@ -57,9 +60,6 @@ pub struct Review {
     pub status: ReviewStatus,
     /// Recorded verdict, if any.
     pub verdict: Option<ReviewVerdict>,
-    /// Deterministic Grid job id for an automatically dispatched review.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner_job_id: Option<String>,
     /// Findings posted against this candidate.
     pub findings: Vec<Finding>,
 }
@@ -227,32 +227,6 @@ impl ReviewStore {
         feature_id: &str,
         request: ReviewStart,
     ) -> Result<(Review, bool), LoomError> {
-        self.start_or_get_inner(feature_id, request, false)
-    }
-
-    /// Starts an automatically dispatched review and records its deterministic
-    /// Grid job identity for restart recovery.
-    ///
-    /// # Errors
-    ///
-    /// Returns under the same conditions as [`Self::start_or_get`].
-    pub fn start_runner_review(&self, feature_id: &str) -> Result<(Review, bool), LoomError> {
-        self.start_or_get_inner(
-            feature_id,
-            ReviewStart {
-                status: Some(ReviewStatus::InProgress),
-                ..ReviewStart::default()
-            },
-            true,
-        )
-    }
-
-    fn start_or_get_inner(
-        &self,
-        feature_id: &str,
-        request: ReviewStart,
-        runner: bool,
-    ) -> Result<(Review, bool), LoomError> {
         let feature = FeatureStore::new(self.store.clone()).get(feature_id)?;
         let candidate_id = feature
             .candidate
@@ -279,7 +253,6 @@ impl ReviewStore {
         });
         let id = Uuid::now_v7().to_string();
         let review = Review {
-            runner_job_id: runner.then(|| format!("rev-{id}")),
             id,
             feature_id: feature_id.to_owned(),
             candidate_id,

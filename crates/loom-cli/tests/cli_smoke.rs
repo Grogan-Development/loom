@@ -49,7 +49,6 @@ fn test_app() -> (tempfile::TempDir, axum::Router, String, String) {
         origin,
         git_program: PathBuf::from("/usr/bin/git"),
         hook_program: PathBuf::from("/usr/bin/true"),
-        review_runner: None,
     })
     .unwrap();
     (directory, app.router(), base.revision, head.revision)
@@ -146,9 +145,7 @@ fn documented_command_shapes_parse_and_use_the_stable_name() {
         &["repo", "list"],
         &["repo", "import", "--project", "billing", "--name", "api"],
         &["project", "list"],
-        &["app", "list"],
-        &["maintain", "status"],
-        &["mcp"],
+        &["backup", "/tmp/loom-backup.tar.gz"],
         &["login", "--url", "http://127.0.0.1:8080", "--token", "x"],
     ];
     for args in cases {

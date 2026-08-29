@@ -1,29 +1,14 @@
-//! First-class Loom projects: grouping for blast radius, secrets, and maintain.
+//! First-class Loom projects: plain grouping for `project/repo` catalog names.
+
+use std::collections::BTreeMap;
+use std::fs::File;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LoomError, validate_repository};
+use crate::{LoomError, PersistentLoomStore, read_bounded, validate_repository, write_atomic};
 
-/// Maintain policy stored on a project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintainPolicy {
-    /// Cron expression in local time (five-field). Empty disables cron wake.
-    #[serde(default)]
-    pub cron: String,
-    /// Pause the maintain queue for every repo in this project.
-    #[serde(default)]
-    pub paused: bool,
-}
-
-impl Default for MaintainPolicy {
-    fn default() -> Self {
-        Self {
-            cron: "17 3 * * *".to_owned(),
-            paused: false,
-        }
-    }
-}
+const MAX_PROJECT_BYTES: u64 = 1024 * 1024;
+const MAX_PROJECTS: usize = 1024;
 
 /// Project grouping `project/repo` catalog names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,19 +19,9 @@ pub struct Project {
     /// Catalog repo names bound to this project.
     #[serde(default)]
     pub repos: Vec<String>,
-    /// Default runtime environment name.
-    #[serde(default = "default_environment")]
-    pub default_environment: String,
-    /// Maintain policy for this project.
-    #[serde(default)]
-    pub maintain_policy: MaintainPolicy,
     /// Owner-facing description.
     #[serde(default)]
     pub description: String,
-}
-
-fn default_environment() -> String {
-    "staging".to_owned()
 }
 
 /// Owner request to create or replace a project.
@@ -58,12 +33,6 @@ pub struct ProjectUpsert {
     /// Bound catalog names.
     #[serde(default)]
     pub repos: Vec<String>,
-    /// Default environment. Defaults to `staging`.
-    #[serde(default)]
-    pub default_environment: Option<String>,
-    /// Maintain policy.
-    #[serde(default)]
-    pub maintain_policy: Option<MaintainPolicy>,
     /// Description.
     #[serde(default)]
     pub description: Option<String>,
@@ -89,22 +58,125 @@ impl ProjectUpsert {
         Ok(Project {
             name: self.name,
             repos: self.repos,
-            default_environment: self
-                .default_environment
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(default_environment),
-            maintain_policy: self.maintain_policy.unwrap_or_default(),
             description: self.description.unwrap_or_default(),
         })
     }
 }
 
-/// Pause request.
-#[derive(Debug, Clone, Deserialize)]
+/// Durable project catalog stored beside the Loom CAS.
+#[derive(Debug, Clone)]
+pub struct ProjectStore {
+    store: PersistentLoomStore,
+}
+
+impl ProjectStore {
+    /// Opens the project catalog inside an existing Loom dataset.
+    #[must_use]
+    pub const fn new(store: PersistentLoomStore) -> Self {
+        Self { store }
+    }
+
+    /// Lists projects sorted by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns for lock, corruption, or I/O failure.
+    pub fn list(&self) -> Result<Vec<Project>, LoomError> {
+        let lock = self.store.shared_lock()?;
+        let projects = self.load()?.into_values().collect();
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(projects)
+    }
+
+    /// Reads one project.
+    ///
+    /// # Errors
+    ///
+    /// Returns for lock, corruption, or I/O failure.
+    pub fn get(&self, name: &str) -> Result<Option<Project>, LoomError> {
+        let lock = self.store.shared_lock()?;
+        let project = self.load()?.get(name).cloned();
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(project)
+    }
+
+    /// Creates or replaces one project.
+    ///
+    /// # Errors
+    ///
+    /// Returns for bounds, lock, or I/O failure.
+    pub fn upsert(&self, project: Project) -> Result<Project, LoomError> {
+        let lock = self.store.exclusive_lock()?;
+        let mut projects = self.load()?;
+        projects.insert(project.name.clone(), project.clone());
+        if projects.len() > MAX_PROJECTS {
+            return Err(LoomError::ResourceLimit);
+        }
+        self.write(&projects)?;
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(project)
+    }
+
+    /// Deletes one project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoomError::UnknownProject`] when absent.
+    pub fn delete(&self, name: &str) -> Result<Project, LoomError> {
+        let lock = self.store.exclusive_lock()?;
+        let mut projects = self.load()?;
+        let removed = projects
+            .remove(name)
+            .ok_or_else(|| LoomError::UnknownProject {
+                name: name.to_owned(),
+            })?;
+        self.write(&projects)?;
+        File::unlock(&lock).map_err(|_| LoomError::StorageUnavailable)?;
+        Ok(removed)
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.store.root.join("projects.json")
+    }
+
+    fn load(&self) -> Result<BTreeMap<String, Project>, LoomError> {
+        let path = self.path();
+        if !path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let bytes = read_bounded(&path, MAX_PROJECT_BYTES)?;
+        let persisted: PersistedProjects =
+            serde_json::from_slice(&bytes).map_err(|_| LoomError::CorruptState)?;
+        if persisted.schema_version != "v1" || persisted.projects.len() > MAX_PROJECTS {
+            return Err(LoomError::CorruptState);
+        }
+        let mut projects = BTreeMap::new();
+        for project in persisted.projects {
+            if projects.insert(project.name.clone(), project).is_some() {
+                return Err(LoomError::CorruptState);
+            }
+        }
+        Ok(projects)
+    }
+
+    fn write(&self, projects: &BTreeMap<String, Project>) -> Result<(), LoomError> {
+        let persisted = PersistedProjects {
+            schema_version: "v1".to_owned(),
+            projects: projects.values().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec(&persisted).map_err(|_| LoomError::Serialization)?;
+        if bytes.len() as u64 > MAX_PROJECT_BYTES {
+            return Err(LoomError::ResourceLimit);
+        }
+        write_atomic(&self.store.root, &self.path(), &bytes, 0o600)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PauseRequest {
-    /// Whether the maintain queue is paused.
-    pub paused: bool,
+struct PersistedProjects {
+    schema_version: String,
+    projects: Vec<Project>,
 }
 
 /// Validates a project identifier (one lowercase segment).

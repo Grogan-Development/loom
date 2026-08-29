@@ -21,7 +21,6 @@ name = "loom-insights"
 path = "src/bin/loom-insights.rs"
 
 [dependencies]
-aes-gcm.workspace = true
 axum.workspace = true
 base64ct.workspace = true
 clap.workspace = true

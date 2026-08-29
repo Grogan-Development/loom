@@ -9,7 +9,6 @@ use serde::Deserialize;
 use crate::catalog::{RepoCatalog, RepoEntry};
 use crate::contracts::RepositoryRevision;
 use crate::git::GitBridge;
-use crate::pack::{looks_like_app, plan};
 use crate::project::validate_project_name;
 use crate::{LoomError, NamespaceGrant, PersistentLoomStore, validate_repository};
 
@@ -27,16 +26,6 @@ pub struct ImportRequest {
     /// Optional shallow depth.
     #[serde(default)]
     pub depth: Option<u32>,
-    /// Create an app when the tree looks deployable. Default true.
-    #[serde(default = "default_true")]
-    pub app: bool,
-    /// Arm maintain. Default true.
-    #[serde(default = "default_true")]
-    pub maintain: bool,
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 /// Import result.
@@ -48,21 +37,6 @@ pub struct ImportResult {
     pub revision: String,
     /// True when history was snapshotted (`import.partial_history`).
     pub partial_history: bool,
-    /// Detected pack.
-    pub pack: String,
-    /// Flags: create app, arm maintain, needs legacy env.
-    pub flags: ImportFlags,
-}
-
-/// Import side effects.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ImportFlags {
-    /// Create an app from the imported tree.
-    pub create_app: bool,
-    /// Arm the maintain loop.
-    pub arm_maintain: bool,
-    /// Engines pin below current LTS.
-    pub needs_legacy: bool,
 }
 
 /// Runs import: catalog upsert, optional git fetch, CAS commit, bootstrap later.
@@ -89,12 +63,6 @@ pub fn import(
             repo,
             revision: revision.revision,
             partial_history: false,
-            pack: "unknown".to_owned(),
-            flags: ImportFlags {
-                create_app: false,
-                arm_maintain: request.maintain,
-                needs_legacy: false,
-            },
         });
     }
     let clone_dir = workdir.join(crate::repository_storage_name(&repo));
@@ -102,18 +70,11 @@ pub fn import(
     std::fs::create_dir_all(&clone_dir).map_err(|_| LoomError::StorageUnavailable)?;
     git_clone(&request.git_url, &clone_dir, request.depth)?;
     let files = read_tree(&clone_dir)?;
-    let detected = plan(&files);
     let revision = commit_files(store, git, &grant, &repo, &clone_dir, &files)?;
     Ok(ImportResult {
         repo,
         revision: revision.revision,
         partial_history: request.depth.is_some(),
-        pack: format!("{:?}", detected.kind).to_ascii_lowercase(),
-        flags: ImportFlags {
-            create_app: request.app && looks_like_app(&files),
-            arm_maintain: request.maintain,
-            needs_legacy: detected.needs_legacy,
-        },
     })
 }
 
