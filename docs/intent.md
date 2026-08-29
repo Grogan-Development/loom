@@ -1,58 +1,33 @@
 # Loom intent
 
-Status: kernel + JSON control-plane **records**. Onboarding, jobs, host runners, live apps-server, and the maintain agent are **not** implemented. Trio contract: [`archive/platform.md`](archive/platform.md).
+Status: advanced git / repo setup. CAS source of truth, Git smart-HTTP gateway, two-gate feature contracts, lightning CI, outbound GitHub mirror, evidence-gated deploys. Trio contract: [`archive/platform.md`](archive/platform.md).
 
-Loom is the source of truth. A private GitHub org (`loomnero`, name is arbitrary) is an offsite mirror only — in case this box dies. Not a second workflow. Not GitHub PRs.
+Loom is the source of truth. A private GitHub org is an offsite mirror only — in case this box dies. Not a second workflow. Not GitHub PRs.
 
 ## Locked product
 
-Git provider + CI that actually runs + apps-server for apps/services + job runner that can target that apps-server **or** a dedicated host + onboarding that locks intent before any rewrite.
+Git provider + CI that actually runs. Nothing else.
 
-- Disconnect = decouple. No Grid, no Incus, no Cursor Origin as SoT or CD. HTTP `Runner` is a trait. Nero is a **harness pattern** and live products (`nero/assistant`, `nero/chat`), not the discarded Grid agent.
-- Work items = **features**, not PRs. A **plan** is a DAG of features. Owner accepts the plan; agents cannot skip nodes.
-- Product features: owner Gate 1 and Gate 2. Scheduler-created `class=maintenance` is born approved. `maintain` accepts only that class. Coding agents stay `git`+`features` on `candidates/*`.
-- **Apps-server** (this host): apps, services, and temp pre-flight previews. Not TZP Minecraft.
-- **Dedicated host**: registered machine with a pull `loom-runner`. TZP Minecraft stays on OVH. Owner does not SSH. Loom jobs replace GitHub Actions / `bbovh`.
-- Agents may deploy only to **pre-flight** (apps-server preview, or `host:<id>` / `dev`). Live is owner-only.
+- Work items = **features**, not PRs. Owner Gate 1 (approve) and Gate 2 (accept). Accept promotes protected refs atomically after CI evidence, with an exact rollback CAS.
+- CI is local and digest-cached (`LocalProcessRunner`); it reads `loom-ci.toml` from the candidate tree. Insights (diff, symbols, blast radius) run pre-flight after CI.
+- Reviews are records with findings and suggested patches; a policy may make an approved review blocking.
 - Names: `project/repo`. Not GitHub orgs as identity.
-- Events JSONL is audit truth. Surreal is a sibling for a later graph projection, not the control store yet.
+- Events JSONL is audit truth.
+- GitHub is an outbound mirror (`origin.rs`): release records, check-run evidence, mirror push, evidence-gated apply scripts.
 
-## Onboarding (next to build)
+## Removed (on purpose)
 
-No coding agent on a project until intent is locked. That is how slop stops eating tokens.
-
-1. Admit bytes: empty import + `git push`, bootstrap `refs/main`. Pack detect. No rewrite.
-2. Classify (automatic, grill can override): `working` | `messy` | `slop` | `abandoned` | `empty`.
-3. Intent draft on the control plane (not a rewritten README).
-4. HITL grill, **project**-scoped. `working` = short confirm. Messy = exact ideas. Slop/abandoned/empty = epitaph unless revived.
-5. Plan DAG. Ingest existing backlogs (TZP `L####` and friends) so slices **target** them. Done items stay historical.
-6. CI bot (`maintain` / subclass `ci`) writes `loom-ci.toml` and pre-flight recipes. Humans do not maintain CI.
-7. Slices on `candidates/*`: lightning CI + insights (LSP + software graph). Evidence must not get worse.
-8. Pre-flight env only for agents. Owner promote to live (apps-server or dedicated host).
-
-Calibration: TZP is `working` (runnable evidence, not scaffold). Empty `printpathfinders` is `empty`. Stale marketing trees are `messy` or `slop`.
-
-## Compute
-
-| Plane | For | Examples |
-| --- | --- | --- |
-| Apps-server | Apps, services, temp preview | `tzp/web` after Railway cutover, `grogan/www`, Nero API |
-| Dedicated host | Boxes that stay boxes | TZP Minecraft on OVH (`dev` + `live`) |
-| Loom jobs | CI / pre-flight / apply on either plane | CI bot emits; `loom-runner` pulls on a host |
-
-`tzp/launcher` is a client (no host). `tzp/web` leaves Railway for the apps-server. Minecraft live/dev stay on `tzp-ovh`. Do not stand up a second Minecraft on grid-01.
+Agent console and chat, memory, skills, model matrix, plans, onboarding/grill, workspaces, docker apps-server, maintain bot, Grid review dispatch, `loom-runner` host jobs, outbound webhooks, MCP surface, project secrets. The pre-strip tree lives on branch `drift/agent-console`.
 
 ## This tree (honest)
 
-**Present:** CAS, protected-ref CAS, native source, Git gateway, two-gate features, digest-cached local CI (`LocalProcessRunner`), tokens including `maintain`, events, insights, reviews. Empty catalog. `project/repo` names. JSON `control.json` (projects, app records, maintain queue, webhooks). `secrets.json`. Import (https or empty). Search/compare/tree/blob. Pack detect. App promote/rollback **records**. Owner dashboard. Backup. MCP **list** (POST is 501). CLI verbs. Compose: caddy + surreal + loomd.
+**Present:** CAS, protected-ref CAS, native source, Git gateway + pre-receive hook, two-gate features, digest-cached local CI, insights, reviews, tokens, events, projects (`projects.json`), catalog + import (https or empty), search/compare/tree/blob, backup, origin mirror + release CI + evidence-gated deploy. CLI verbs: events, feature, candidate, evidence, insights, review, comment, status, login, repo, project, backup. Compose: caddy + loomd.
 
-**Absent:** classify / intent grill / Plan object. `loom-runner` / host registry / job dispatch. Docker image build/smoke (`ImageMissing`). Real app processes. Planner loop. GitHub mirror push. MCP execution.
-
-Origin/Grid flags still exist on `loomd`. They are leftover, not the product.
+**Absent:** anything agent-shaped. Remote CI runners. If a feature is needed later, it gets designed against this kernel, not bolted on.
 
 ## First fleet
 
-Empty import + push from a laptop (no GitHub token on the host). Closed loop after land: one feature accept on `loom/loom`. Then build onboarding before any repair agents.
+Empty import + push from a laptop (no GitHub token on the host). Closed loop after land: one feature accept on `loom/loom`.
 
 | Project | Repo | Source |
 | --- | --- | --- |
@@ -71,11 +46,3 @@ Empty import + push from a laptop (no GitHub token on the host). Closed loop aft
 | `tzp` | `infra` | `bloodbath-infra` |
 | `tzp` | `web` | `tzp-web` |
 | `tzp` | `launcher` | `tzp-launcher` |
-
-## Names (do not collide)
-
-- **Insights** — digest-cached LSP + software-graph analysis on a candidate.
-- **Onboarding** — first-run classify + intent + grill.
-- **Pre-flight env** — AI test server (`apps-server` preview or `host:<id>` / `dev`).
-- **Loom jobs** — GH Actions replacement. Not `.github/workflows` as source of truth.
-- **Nero** — harness pattern + the `nero/*` products. Not Grid’s coding agent.
